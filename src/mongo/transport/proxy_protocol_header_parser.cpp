@@ -30,6 +30,7 @@
 
 #include "mongo/transport/proxy_protocol_header_parser.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -49,6 +50,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/platform/endian.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/ctype.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
@@ -75,12 +77,18 @@ void validateIpv4Address(StringData addr) {
         NumberParser().skipWhitespace(false).base(10).allowTrailingText(false);
     try {
         for (size_t i = 0; i < 4; ++i) {
+            const StringData octetStr = (i == 3) ? buffer : parseToken(buffer, '.');
+            // Only accept canonical dotted-decimal octets (no sign, no leading zeros) so the
+            // address is always resolvable as a numeric host without falling back to DNS.
+            uassert(ErrorCodes::FailedToParse,
+                    fmt::format("Proxy Protocol Version 1 address string specified malformed "
+                                "IPv4 octet: {}",
+                                octetStr),
+                    !octetStr.empty() && octetStr.size() <= 3 &&
+                        std::all_of(octetStr.begin(), octetStr.end(), ctype::isDigit) &&
+                        (octetStr.size() == 1 || octetStr[0] != '0'));
             unsigned octet = 0;
-            if (i == 3) {
-                uassertStatusOK(octetParser(buffer, &octet));
-            } else {
-                uassertStatusOK(octetParser(parseToken(buffer, '.'), &octet));
-            }
+            uassertStatusOK(octetParser(octetStr, &octet));
             uassert(
                 ErrorCodes::FailedToParse,
                 fmt::format(
@@ -104,13 +112,14 @@ void validateIpv6Address(StringData addr) {
         auto validateHexadectet = [](StringData hexadectet) {
             const NumberParser hexadectetParser =
                 NumberParser().skipWhitespace(false).base(16).allowTrailingText(false);
-            unsigned value = 0;
-            uassertStatusOK(hexadectetParser(hexadectet, &value));
             uassert(ErrorCodes::FailedToParse,
                     fmt::format("Proxy Protocol Version 1 address string contains malformed IPv6 "
                                 "hexadectet: {}",
                                 hexadectet),
-                    hexadectet.size() == 4);
+                    hexadectet.size() == 4 &&
+                        std::all_of(hexadectet.begin(), hexadectet.end(), ctype::isXdigit));
+            unsigned value = 0;
+            uassertStatusOK(hexadectetParser(hexadectet, &value));
         };
 
         if (buffer.empty())
