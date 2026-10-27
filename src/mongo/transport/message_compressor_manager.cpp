@@ -218,6 +218,13 @@ void MessageCompressorManager::clientFinish(const BSONObj& input) {
     for (const auto& e : elem.Obj()) {
         auto algoName = e.checkAndGetStringData();
         auto ret = _registry->getCompressor(algoName);
+        if (!ret) {
+            LOGV2_DEBUG(11298200,
+                        3,
+                        "Ignoring unsupported compressor sent by server",
+                        "compressor"_attr = algoName);
+            continue;
+        }
         LOGV2_DEBUG(22933, 3, "Adding compressor", "compressor"_attr = ret->getName());
         _negotiated.push_back(ret);
     }
