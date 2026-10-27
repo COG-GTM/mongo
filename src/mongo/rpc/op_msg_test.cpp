@@ -460,6 +460,90 @@ TEST_F(OpMsgParser, FailsIfDocumentInSequenceTooBig) {
     ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
 }
 
+BSONObj makeDocOfSize(int size) {
+    BSONObjBuilder bob;
+    // Object header/terminator (5) + type (1) + "x\0" (2) + string length (4) + string NUL (1).
+    bob.append("x", std::string(size - 13, 'x'));
+    auto obj = bob.obj();
+    invariant(obj.objsize() == size);
+    return obj;
+}
+
+TEST_F(OpMsgParser, SucceedsWithDocumentInSequenceAtMaxSize) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                makeDocOfSize(BSONObjMaxInternalSize),
+            },
+        }
+            .parse();
+
+    ASSERT_EQ(msg.sequences.size(), 1u);
+    ASSERT_EQ(msg.sequences[0].objs.size(), 1u);
+    ASSERT_EQ(msg.sequences[0].objs[0].objsize(), BSONObjMaxInternalSize);
+}
+
+TEST_F(OpMsgParser, FailsIfDocumentInSequenceExceedsMaxSizeBeforeBody) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kDocSequenceSection,
+        Sized{
+            "docs",  //
+            makeDocOfSize(BSONObjMaxInternalSize + 1),
+        },
+
+        kBodySection,
+        fromjson("{ping: 1}"),
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::BSONObjectTooLarge);
+}
+
+TEST_F(OpMsgParser, FailsIfDocumentInSequenceExceedsMaxSizeAfterBody) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{
+            "docs",  //
+            fromjson("{a: 1}"),
+            makeDocOfSize(BSONObjMaxInternalSize + 1),
+        },
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::BSONObjectTooLarge);
+}
+
+TEST_F(OpMsgParser, SucceedsWithLargeBodyThenSmallDocumentInSequence) {
+    // The body may exceed the per-document limit; it must not be used to size-check sequence
+    // documents.
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            makeDocOfSize(BSONObjMaxInternalSize + 1),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+            },
+        }
+            .parse();
+
+    ASSERT_EQ(msg.body.objsize(), BSONObjMaxInternalSize + 1);
+    ASSERT_EQ(msg.sequences.size(), 1u);
+    ASSERT_BSONOBJ_EQ(msg.sequences[0].objs[0], fromjson("{a: 1}"));
+}
+
 TEST_F(OpMsgParser, FailsIfNameOfDocumentSequenceTooBig) {
     auto msg = OpMsgBytes{
         kNoFlags,  //
