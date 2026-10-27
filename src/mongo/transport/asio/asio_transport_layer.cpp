@@ -32,6 +32,7 @@
 
 #include <fstream>
 #include <functional>
+#include <limits>
 
 #include <fmt/format.h>
 
@@ -1341,8 +1342,21 @@ bool isTcp(Protocol&& p) {
 
 std::unique_ptr<AsioTransportLayer::TokenType>
 AsioTransportLayer::_makeParseProxyTokenIfPossible() {
+    // Pending proxy connections hold a socket without being counted by the `SessionManager`, so
+    // they must also fit within its file descriptor based session limit (see `getSupportedMax`).
+    std::size_t openSessions = 0;
+    std::size_t maxOpenSessions = std::numeric_limits<std::size_t>::max();
+    if (_sessionManager) {
+        openSessions = _sessionManager->numOpenSessions();
+        maxOpenSessions = _sessionManager->maxOpenSessions();
+    }
+
     stdx::lock_guard lk(_mutex);
     if (_numConnectionsPendingProxyHeader >= gProxyProtocolMaximumPendingConnections.load()) {
+        return {};
+    }
+    const auto pending = static_cast<std::size_t>(_numConnectionsPendingProxyHeader);
+    if (openSessions >= maxOpenSessions || pending >= maxOpenSessions - openSessions) {
         return {};
     }
     ++_numConnectionsPendingProxyHeader;
@@ -1397,7 +1411,9 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                 // Therefore, the server may go above the ingress connection limits if it is waiting
                 // to receive the proxy header for many accepted connections.
                 // Thus, the server limits the number of connections received on the proxy port that
-                // are yet to provide the proxy header.
+                // are yet to provide the proxy header, both by
+                // `proxyProtocolMaximumPendingConnections` and by the capacity left under the
+                // `SessionManager` limit on open sessions.
                 auto token = _makeParseProxyTokenIfPossible();
                 if (MONGO_unlikely(!token)) {
                     static logv2::SeveritySuppressor severitySuppressor{
@@ -1410,6 +1426,8 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                         "pending on proxy protocol header",
                         "remote"_attr = session->remote(),
                         "limit"_attr = gProxyProtocolMaximumPendingConnections.loadRelaxed(),
+                        "openSessions"_attr = _sessionManager->numOpenSessions(),
+                        "maxOpenSessions"_attr = _sessionManager->maxOpenSessions(),
                         "rejected"_attr = _discardedDueToMaximumPendingOnProxyHeader.get());
                     _acceptConnection(acceptor);
                     return;
