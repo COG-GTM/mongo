@@ -123,8 +123,10 @@ void NamedPipeOutput::close() {
 #undef MONGO_LOGV2_DEFAULT_COMPONENT
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-NamedPipeInput::NamedPipeInput(const std::string& pipeRelativePath)
+NamedPipeInput::NamedPipeInput(const std::string& pipeRelativePath,
+                               std::function<void()> checkForInterrupt)
     : _pipeAbsolutePath(kDefaultPipePath + pipeRelativePath),
+      _checkForInterrupt(std::move(checkForInterrupt)),
       _pipe(INVALID_HANDLE_VALUE),
       _isOpen(false),
       _isGood(false),
@@ -147,6 +149,9 @@ void NamedPipeInput::doOpen() {
         _pipe = CreateFileA(
             _pipeAbsolutePath.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (_pipe == INVALID_HANDLE_VALUE) {
+            if (_checkForInterrupt) {
+                _checkForInterrupt();
+            }
             stdx::this_thread::sleep_for(stdx::chrono::milliseconds(sleepMs));
             ++retries;
             if (retries % 1000 == 0) {

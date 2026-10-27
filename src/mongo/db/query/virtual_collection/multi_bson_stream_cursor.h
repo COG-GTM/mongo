@@ -50,8 +50,9 @@
 namespace mongo {
 class MultiBsonStreamCursor : public SeekableRecordCursor {
 public:
-    MultiBsonStreamCursor(const VirtualCollectionOptions& vopts)
-        : _numStreams(vopts.dataSources.size()), _vopts(vopts) {
+    // If 'opCtx' is set, it is checked for interruption while waiting on a named pipe.
+    MultiBsonStreamCursor(const VirtualCollectionOptions& vopts, OperationContext* opCtx = nullptr)
+        : _numStreams(vopts.dataSources.size()), _vopts(vopts), _opCtx(opCtx) {
         tassert(6968310, fmt::format("_numStreams {} <= 0", _numStreams), _numStreams > 0);
         _streamReader = getInputStream(_vopts.dataSources[_streamIdx].url);
     }
@@ -65,8 +66,12 @@ public:
     bool restore(RecoveryUnit& ru, bool tolerateCappedRepositioning) override {
         return true;
     }
-    void detachFromOperationContext() override {}
-    void reattachToOperationContext(OperationContext* opCtx) override {}
+    void detachFromOperationContext() override {
+        _opCtx = nullptr;
+    }
+    void reattachToOperationContext(OperationContext* opCtx) override {
+        _opCtx = opCtx;
+    }
     void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
 
     // Seeking is not currently supported.
@@ -84,7 +89,7 @@ public:
 private:
     void expandBuffer(int32_t bsonSize);
     boost::optional<Record> nextFromCurrentStream();
-    static std::unique_ptr<InputStream<NamedPipeInput>> getInputStream(const std::string& url);
+    std::unique_ptr<InputStream<NamedPipeInput>> getInputStream(const std::string& url);
 
     // The size in bytes of a BSON object's "size" prefix.
     static constexpr int kSizeSize = static_cast<int>(sizeof(int32_t));
@@ -117,5 +122,7 @@ private:
     std::unique_ptr<InputStream<NamedPipeInput>> _streamReader = nullptr;
 
     const VirtualCollectionOptions& _vopts;  // metadata containing the pipe URLs
+
+    OperationContext* _opCtx;  // checked for interruption while waiting on a pipe
 };
 }  // namespace mongo
