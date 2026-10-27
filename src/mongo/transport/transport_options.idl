@@ -162,9 +162,10 @@ server_parameters:
         description: >-
             Decides the maximum number of connections accepted from the proxy port that are yet to
             provide the proxy protocol header. Once the server reaches this threshold, it will
-            reject new connections accepted from the proxy port. Regardless of this value, the
-            number of pending connections never exceeds the maximum number of open sessions, which
-            is derived from maxConns and the open file limit.
+            reject new connections accepted from the proxy port. Regardless of this value, pending
+            connections are also limited to the capacity left under the maximum number of open
+            sessions (derived from maxConns and the open file limit), with a small reserve for
+            clients exempted by maxIncomingConnectionsOverride.
         set_at: [startup, runtime]
         cpp_varname: gProxyProtocolMaximumPendingConnections
         cpp_vartype: Atomic<int32_t>
