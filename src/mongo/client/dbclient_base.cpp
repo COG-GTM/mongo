@@ -238,13 +238,13 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
         throw;
     }
 
-    auto commandReply = parseCommandReplyMessage(host, replyMsg);
-
     uassert(ErrorCodes::RPCProtocolNegotiationFailed,
             str::stream() << "Mismatched RPC protocols - request was '"
                           << networkOpToString(requestMsg.operation()) << "' '"
                           << " but reply was '" << networkOpToString(replyMsg.operation()) << "' ",
-            rpc::protocolForMessage(requestMsg) == commandReply->getProtocol());
+            requestMsg.operation() == replyMsg.operation());
+
+    auto commandReply = parseCommandReplyMessage(host, replyMsg);
 
     return {std::move(commandReply), this};
 }

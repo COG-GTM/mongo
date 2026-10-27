@@ -37,6 +37,8 @@
 #include "mongo/bson/json.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_reply.h"
 #include "mongo/rpc/legacy_reply_builder.h"
@@ -47,7 +49,9 @@
 #include "mongo/stdx/type_traits.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/shared_buffer.h"
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -245,6 +249,31 @@ void testErrors(rpc::ReplyBuilderInterface& replyBuilder) {
     ASSERT(result.extraInfo());
     ASSERT(result.extraInfo<ErrorExtraInfoExample>());
     ASSERT_EQ(result.extraInfo<ErrorExtraInfoExample>()->data, 123);
+}
+
+Message makeOpReplyOfSize(int size) {
+    auto buf = SharedBuffer::allocate(size);
+    std::memset(buf.get(), 0, size);
+    Message msg(std::move(buf));
+    msg.header().setLen(size);
+    msg.header().setOperation(opReply);
+    return msg;
+}
+
+TEST(LegacyReply, RejectsRepliesShorterThanQueryResultHeader) {
+    const int kHeaderSize = static_cast<int>(sizeof(MSGHEADER::Layout));
+    const int kQueryResultSize = static_cast<int>(sizeof(QueryResult::Layout));
+    for (int size : {kHeaderSize, 20, 28, 32, kQueryResultSize - 1}) {
+        auto msg = makeOpReplyOfSize(size);
+        ASSERT_THROWS_CODE(rpc::makeReply(&msg), AssertionException, ErrorCodes::ProtocolError);
+    }
+}
+
+TEST(LegacyReply, RejectsReplyWithNoBSONBody) {
+    auto msg = makeOpReplyOfSize(sizeof(QueryResult::Layout));
+    QueryResult::View qr = msg.singleData().view2ptr();
+    qr.setNReturned(1);
+    ASSERT_THROWS_CODE(rpc::makeReply(&msg), AssertionException, ErrorCodes::InvalidBSON);
 }
 
 }  // namespace
