@@ -46,6 +46,7 @@
 #include "mongo/transport/test_fixtures.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_layer_manager_impl.h"
+#include "mongo/transport/transport_options.h"
 #include "mongo/transport/transport_options_gen.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/thread_assertion_monitor.h"
@@ -1199,6 +1200,99 @@ TEST_F(AsioTransportLayerWithRouterLoadBalancerPortsTest, DifferentiatesConnecti
 TEST_F(AsioTransportLayerWithRouterLoadBalancerPortsTest,
        DifferentiatesConnectionsLoadBalancerPort) {
     doDifferentiatesConnectionsCase(kLoadBalancerPort);
+}
+
+class AsioTransportLayerProxyProtocolTrustedSourcesTest : public ServiceContextTest {
+public:
+    static constexpr auto kMainPort = 22010;
+    static constexpr auto kLoadBalancerPort = 22012;
+
+    // A client connecting directly to the load-balancer port claims to be an internal address.
+    inline static const std::string kSpoofedProxyProtocolHeader =
+        "PROXY TCP4 10.0.0.5 54.225.237.121 1000 3000\r\n";
+
+    void startTransportLayer(std::vector<std::string> trustedSources) {
+        _trustedSources.emplace(gProxyProtocolTrustedSources, std::move(trustedSources));
+        auto options = defaultTLAOptions();
+        options.port = kMainPort;
+        options.loadBalancerPort = kLoadBalancerPort;
+        _fixture = std::make_unique<TestFixture>(options);
+    }
+
+    void tearDown() override {
+        _fixture.reset();
+        _trustedSources.reset();
+    }
+
+    TestFixture& fixture() {
+        return *_fixture;
+    }
+
+    long long rejectedUntrustedProxySources() {
+        BSONObjBuilder bob;
+        _fixture->tla().appendStatsForServerStatus(&bob);
+        return bob.obj()["connsRejectedDueToUntrustedProxyProtocolSource"].numberLong();
+    }
+
+    void sendSpoofedHeader() {
+        SyncClient client(kLoadBalancerPort);
+        auto ec =
+            client.write(kSpoofedProxyProtocolHeader.data(), kSpoofedProxyProtocolHeader.size());
+        ASSERT_FALSE(ec) << errorMessage(ec);
+    }
+
+private:
+    std::shared_ptr<void> _disableTfo = tfo::setConfigForTest(0, 0, 0, 1024, Status::OK());
+    boost::optional<ScopedValueGuard<std::vector<std::string>>> _trustedSources;
+    std::unique_ptr<TestFixture> _fixture;
+};
+
+TEST_F(AsioTransportLayerProxyProtocolTrustedSourcesTest, RejectsHeaderFromUntrustedPeer) {
+    startTransportLayer({"192.0.2.0/24"});
+    AtomicWord<int> sessionsStarted{0};
+    fixture().sessionManager().setOnStartSession(
+        [&](test::SessionThread&) { sessionsStarted.addAndFetch(1); });
+
+    sendSpoofedHeader();
+
+    const auto deadline = Date_t::now() + Seconds(10);
+    while (rejectedUntrustedProxySources() < 1 && Date_t::now() < deadline) {
+        sleepFor(Milliseconds(10));
+    }
+    ASSERT_EQ(rejectedUntrustedProxySources(), 1);
+    ASSERT_EQ(sessionsStarted.load(), 0);
+
+    // The main port is unaffected by the trusted proxy list.
+    ASSERT_OK(
+        fixture()
+            .tla()
+            .connect({testHostName(), kMainPort}, ConnectSSLMode::kDisableSSL, Seconds{10}, {})
+            .getStatus());
+}
+
+TEST_F(AsioTransportLayerProxyProtocolTrustedSourcesTest, AcceptsHeaderFromTrustedPeer) {
+    startTransportLayer({"192.0.2.0/24", "127.0.0.0/8", "::1/128"});
+    auto onStartSession = std::make_shared<Notification<void>>();
+    fixture().sessionManager().setOnStartSession([&](test::SessionThread& st) {
+        ASSERT_TRUE(st.session()->isConnectedToLoadBalancerPort());
+        ASSERT_EQ(st.session()->getSourceRemoteEndpoint().host(), "10.0.0.5");
+        onStartSession->set();
+    });
+
+    sendSpoofedHeader();
+
+    onStartSession->get();
+    ASSERT_EQ(rejectedUntrustedProxySources(), 0);
+}
+
+TEST(ProxyProtocolTrustedSourcesTest, ParsesCIDRsAndRejectsGarbage) {
+    ASSERT_OK(parseProxyProtocolTrustedSources({}).getStatus());
+    auto swTrusted = parseProxyProtocolTrustedSources({"10.0.0.0/8", "127.0.0.1", "::1/128"});
+    ASSERT_OK(swTrusted.getStatus());
+    ASSERT_EQ(swTrusted.getValue().size(), 3);
+    ASSERT_EQ(parseProxyProtocolTrustedSources({"10.0.0.0/8", "not-a-cidr"}).getStatus(),
+              ErrorCodes::BadValue);
+    ASSERT_EQ(parseProxyProtocolTrustedSources({""}).getStatus(), ErrorCodes::BadValue);
 }
 
 #ifdef __linux__

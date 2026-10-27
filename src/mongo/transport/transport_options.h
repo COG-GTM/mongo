@@ -28,6 +28,14 @@
  */
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/net/cidr.h"
+
+#include <string>
+#include <vector>
+
+#include <boost/optional.hpp>
 
 namespace mongo::transport {
 Status onUpdateEstablishmentRefreshRate(int32_t newValue);
@@ -35,4 +43,13 @@ Status onUpdateEstablishmentRefreshRate(int32_t newValue);
 Status onUpdateEstablishmentBurstCapacitySecs(double newValue);
 
 Status onUpdateEstablishmentMaxQueueDepth(int32_t newValue);
+
+/**
+ * Parses `proxyProtocolTrustedSources` entries. Each entry must be a CIDR range or, on non-Windows
+ * platforms, an absolute Unix domain socket path.
+ */
+StatusWith<CIDRList> parseProxyProtocolTrustedSources(const std::vector<std::string>& sources);
+
+Status validateProxyProtocolTrustedSources(const std::vector<std::string>& sources,
+                                           const boost::optional<TenantId>&);
 }  // namespace mongo::transport
