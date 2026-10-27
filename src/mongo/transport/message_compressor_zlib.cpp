@@ -79,8 +79,8 @@ StatusWith<std::size_t> ZlibMessageCompressor::decompressData(ConstDataRange inp
         return Status{ErrorCodes::BadValue, "Compressed message was invalid or corrupted"};
     }
 
-    counterHitDecompress(input.length(), output.length());
-    return {output.length()};
+    counterHitDecompress(input.length(), length);
+    return {static_cast<std::size_t>(length)};
 }
 
 
