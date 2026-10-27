@@ -383,6 +383,35 @@ TEST(ProxyProtocolHeaderParser, MalformedV2Headers) {
     parseStringExpectFailure(header.toString(), "too short");
 }
 
+TEST(ProxyProtocolHeaderParser, V2HeaderLongerThanPeekBufferFailsFast) {
+    using namespace std::string_literals;
+    const std::string prefix = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A\x21\x11"s;
+
+    // A declared length that cannot fit in the peek buffer is rejected as soon as the length
+    // field is available, rather than waiting for bytes the server will never peek.
+    for (const auto& length : {"\x02\x09"s, "\x10\x00"s, "\xFF\xFF"s}) {
+        try {
+            parseProxyProtocolHeader(prefix + length);
+            FAIL("Expected to throw");
+        } catch (const DBException& ex) {
+            ASSERT_THAT(ex.toStatus(),
+                        StatusIs(Eq(ErrorCodes::FailedToParse), ContainsRegex("too long")));
+        }
+    }
+
+    // The largest length that fits in the peek buffer is still accepted.
+    const std::string maxLength = "\x02\x08"s;
+    ASSERT_EQ(prefix.size() + maxLength.size(), 16u);
+    const std::string addresses = std::string(12, '\1');
+    const std::string tlvs = std::string(kProxyProtocolHeaderSizeUpperBound - 16 - 12, '\0');
+    const std::string full = prefix + maxLength + addresses + tlvs;
+    ASSERT_EQ(full.size(), kProxyProtocolHeaderSizeUpperBound);
+    ASSERT_FALSE(parseProxyProtocolHeader(prefix + maxLength));
+    auto results = parseProxyProtocolHeader(full);
+    ASSERT_TRUE(results);
+    ASSERT_EQ(results->bytesParsed, kProxyProtocolHeaderSizeUpperBound);
+}
+
 template <typename SockAddrUn = sockaddr_un>
 std::pair<SockAddrUn, SockAddrUn> createTestSockAddrUn(std::string srcPath, std::string dstPath) {
     std::pair<SockAddrUn, SockAddrUn> addrs;

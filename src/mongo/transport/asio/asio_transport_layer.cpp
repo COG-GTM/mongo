@@ -30,8 +30,10 @@
 
 #include "mongo/transport/asio/asio_transport_layer.h"
 
+#include <algorithm>
 #include <fstream>
 #include <functional>
+#include <limits>
 
 #include <fmt/format.h>
 
@@ -1337,12 +1339,32 @@ bool isTcp(Protocol&& p) {
     return (pf == AF_INET || pf == AF_INET6) && (pt == SOCK_STREAM) &&
         (pp == IPPROTO_IP || pp == IPPROTO_TCP);
 }
+
+// Fraction of the session limit that connections pending on the proxy protocol header may always
+// use, even when the session limit has been reached.
+constexpr std::size_t kPendingProxyExemptReserveDivisor = 10;
+
 }  // namespace
 
 std::unique_ptr<AsioTransportLayer::TokenType>
 AsioTransportLayer::_makeParseProxyTokenIfPossible() {
+    // Pending proxy connections hold a socket without being counted by the `SessionManager`, so
+    // they must fit within the capacity left under its file descriptor based session limit (see
+    // `getSupportedMax`). Clients exempted by `maxIncomingConnectionsOverride` are only identified
+    // once the header is parsed, so a small reserve stays available for them at the session limit.
+    std::size_t pendingLimit = std::numeric_limits<std::size_t>::max();
+    if (_sessionManager) {
+        const auto openSessions = _sessionManager->numOpenSessions();
+        const auto maxOpenSessions = _sessionManager->maxOpenSessions();
+        const auto remaining = openSessions < maxOpenSessions ? maxOpenSessions - openSessions : 0;
+        const auto exemptReserve =
+            std::max<std::size_t>(1, maxOpenSessions / kPendingProxyExemptReserveDivisor);
+        pendingLimit = std::max(remaining, exemptReserve);
+    }
+
     stdx::lock_guard lk(_mutex);
-    if (_numConnectionsPendingProxyHeader >= gProxyProtocolMaximumPendingConnections.load()) {
+    if (_numConnectionsPendingProxyHeader >= gProxyProtocolMaximumPendingConnections.load() ||
+        static_cast<std::size_t>(_numConnectionsPendingProxyHeader) >= pendingLimit) {
         return {};
     }
     ++_numConnectionsPendingProxyHeader;
@@ -1397,7 +1419,9 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                 // Therefore, the server may go above the ingress connection limits if it is waiting
                 // to receive the proxy header for many accepted connections.
                 // Thus, the server limits the number of connections received on the proxy port that
-                // are yet to provide the proxy header.
+                // are yet to provide the proxy header, both by
+                // `proxyProtocolMaximumPendingConnections` and by the capacity left under the
+                // `SessionManager` limit on open sessions.
                 auto token = _makeParseProxyTokenIfPossible();
                 if (MONGO_unlikely(!token)) {
                     static logv2::SeveritySuppressor severitySuppressor{
@@ -1410,6 +1434,8 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                         "pending on proxy protocol header",
                         "remote"_attr = session->remote(),
                         "limit"_attr = gProxyProtocolMaximumPendingConnections.loadRelaxed(),
+                        "openSessions"_attr = _sessionManager->numOpenSessions(),
+                        "maxOpenSessions"_attr = _sessionManager->maxOpenSessions(),
                         "rejected"_attr = _discardedDueToMaximumPendingOnProxyHeader.get());
                     _acceptConnection(acceptor);
                     return;

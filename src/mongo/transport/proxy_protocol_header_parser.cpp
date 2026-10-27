@@ -290,6 +290,10 @@ bool parseV1Buffer(StringData& buffer, boost::optional<ProxiedEndpoints>& endpoi
 // Since this string contains a null, it's critical we use a literal here.
 constexpr StringData kV2Start = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A"_sd;
 
+// Signature, version/command byte, family/protocol byte and the 2-byte length.
+constexpr size_t kV2FixedHeaderSize = 16;
+constexpr size_t kMaximumV2PayloadLength = kProxyProtocolHeaderSizeUpperBound - kV2FixedHeaderSize;
+
 bool parseV2Buffer(StringData& buffer, boost::optional<ProxiedEndpoints>& endpoints) {
     buffer = buffer.substr(kV2Start.size());
     if (buffer.empty())
@@ -354,6 +358,13 @@ bool parseV2Buffer(StringData& buffer, boost::optional<ProxiedEndpoints>& endpoi
             return false;
 
         const size_t length = endian::bigToNative(extract<uint16_t>(buffer));
+        // The server only ever peeks `kProxyProtocolHeaderSizeUpperBound` bytes, so a longer
+        // header could never be completed and would hold the connection until the timeout.
+        uassert(ErrorCodes::FailedToParse,
+                fmt::format("Proxy Protocol Version 2 header length too long: {}, maximum: {}",
+                            length,
+                            kMaximumV2PayloadLength),
+                length <= kMaximumV2PayloadLength);
         if (buffer.size() < length)
             return false;
 
