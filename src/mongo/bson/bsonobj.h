@@ -1008,6 +1008,24 @@ struct DataType::Handler<BSONObj> {
                        size_t length,
                        size_t* advanced,
                        std::ptrdiff_t debug_offset) noexcept try {
+        // Bound the declared object size by the available bytes regardless of whether full BSON
+        // validation (e.g. net.wireObjectCheck) is enabled, so callers never advance past the end.
+        if (length < sizeof(int32_t)) {
+            return Status(ErrorCodes::InvalidBSON,
+                          fmt::format("Not enough bytes to read BSON object size: have {} at "
+                                      "offset {}",
+                                      length,
+                                      debug_offset));
+        }
+        const int32_t declaredSize = ConstDataView(ptr).read<LittleEndian<int32_t>>();
+        if (declaredSize < 0 || static_cast<size_t>(declaredSize) > length) {
+            return Status(ErrorCodes::InvalidBSON,
+                          fmt::format("BSON object size {} exceeds the {} bytes available at "
+                                      "offset {}",
+                                      declaredSize,
+                                      length,
+                                      debug_offset));
+        }
         auto temp = BSONObj(ptr);
         auto len = temp.objsize();
         if (bson) {

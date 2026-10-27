@@ -211,7 +211,7 @@ OpMsg OpMsg::parse(const Message& message, Client* client) try {
                     // For document sequences, each document must be within the 16MB document limit.
                     // See the OP_MSG documentation for further details on the size limits:
                     // https://github.com/mongodb/specifications/blob/master/source/message/OP_MSG.md#sections.
-                    uassertStatusOK(msg.body.validateBSONObjSize().addContext(
+                    uassertStatusOK(obj.val.validateBSONObjSize().addContext(
                         "Parsing opMsg DocSequence failed"));
                     msg.sequences.back().objs.push_back(obj);
                 }
