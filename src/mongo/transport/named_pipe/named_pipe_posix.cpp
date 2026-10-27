@@ -37,12 +37,18 @@
 #include "mongo/transport/named_pipe/io_error_message.h"
 #include "mongo/transport/named_pipe/named_pipe.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <fstream>  // IWYU pragma: keep
 #include <string>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include <fmt/format.h>
 #include <sys/stat.h>
@@ -127,10 +133,24 @@ void NamedPipeOutput::close() {
 #undef MONGO_LOGV2_DEFAULT_COMPONENT
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-NamedPipeInput::NamedPipeInput(const std::string& pipeRelativePath)
+namespace {
+using Clock = stdx::chrono::steady_clock;
+
+// How long a single wait for the pipe, a writer, or data may last before re-checking for
+// interruption and the open deadline.
+constexpr int kPollSliceMs = 100;
+
+int remainingMs(Clock::time_point deadline) {
+    auto ms = stdx::chrono::duration_cast<stdx::chrono::milliseconds>(deadline - Clock::now());
+    return ms.count() > 0 ? static_cast<int>(ms.count()) : 0;
+}
+}  // namespace
+
+NamedPipeInput::NamedPipeInput(const std::string& pipeRelativePath,
+                               std::function<void()> checkForInterrupt)
     : _pipeAbsolutePath((externalPipeDir == "" ? kDefaultPipePath : externalPipeDir) +
                         pipeRelativePath),
-      _ifs() {
+      _checkForInterrupt(std::move(checkForInterrupt)) {
     uassert(7001100,
             fmt::format("Pipe path must not include '..' but {} does", _pipeAbsolutePath),
             _pipeAbsolutePath.find("..") == std::string::npos);
@@ -141,64 +161,166 @@ NamedPipeInput::~NamedPipeInput() {
 }
 
 void NamedPipeInput::doOpen() {
-    // MultiBsonStreamCursor's (MBSC) assembly buffer is designed to perform well without a lower-
-    // layer IO buffer. Removing std::ifstream's default 8k "associated buffer" improves throughput
-    // by 1.9% by eliminating the hidden copies from that buffer to MBSC's buffer. MBSC itself will
-    // never copy data except when it (rarely) needs to expand its buffer, so by removing
-    // std::ifstream's buffer we get an essentially zero-copy cursor that still avoids lots of tiny
-    // IOs due to MBSC's assembly buffer algorithm.
-    _ifs.rdbuf()->pubsetbuf(0, 0);
+    const auto start = Clock::now();
+    const auto deadline = start + stdx::chrono::milliseconds(kOpenTimeoutMs);
 
-    // Retry the open every {1, 2, 4, 8, 16} ms for 1,000 reps each (allowing up to 31 seconds of
-    // retry) in case the pipe writer has not finished creating the pipe yet.
+    // Retry the open every {1, 2, 4, 8, 16} ms (bounded by 'kOpenTimeoutMs' overall) in case the
+    // pipe writer has not finished creating the pipe yet. O_NONBLOCK keeps open() from blocking
+    // until a writer attaches and O_NOFOLLOW refuses a symlink in place of the pipe.
     int retries = 0;
     int sleepMs = 1;
-    bool opened;
-    do {
-        _ifs.open(_pipeAbsolutePath.c_str(), std::ios::binary | std::ios::in);
-        opened = _ifs.is_open();
-        if (!opened) {
-            uassert(ErrorCodes::FileNotOpen,
-                    fmt::format("error = {}",
-                                getLastSystemErrorMessageFormatted("open", _pipeAbsolutePath)),
-                    errno == ENOENT);
-            stdx::this_thread::sleep_for(stdx::chrono::milliseconds(sleepMs));
-            ++retries;
-            if (retries % 1000 == 0) {
-                sleepMs *= 2;
-            }
+    int fd;
+    while ((fd = ::open(_pipeAbsolutePath.c_str(),
+                        O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)) < 0) {
+        uassert(ErrorCodes::FileNotOpen,
+                fmt::format("error = {}",
+                            getLastSystemErrorMessageFormatted("open", _pipeAbsolutePath)),
+                errno == ENOENT || errno == EINTR);
+        uassert(ErrorCodes::FileNotOpen,
+                fmt::format("Named pipe {} was not created within {} ms",
+                            _pipeAbsolutePath,
+                            kOpenTimeoutMs),
+                Clock::now() < deadline);
+        if (_checkForInterrupt) {
+            _checkForInterrupt();
         }
-    } while (!opened && retries <= 5000);
-    if (retries > 1000) {
+        stdx::this_thread::sleep_for(
+            stdx::chrono::milliseconds(std::min(sleepMs, std::max(remainingMs(deadline), 1))));
+        ++retries;
+        if (retries % 1000 == 0 && sleepMs < 16) {
+            sleepMs *= 2;
+        }
+    }
+    _fd = fd;
+    ScopeGuard closeOnError([&] { doClose(); });
+
+    struct stat st;
+    uassert(
+        ErrorCodes::FileNotOpen,
+        fmt::format("error = {}", getLastSystemErrorMessageFormatted("fstat", _pipeAbsolutePath)),
+        ::fstat(_fd, &st) == 0);
+    uassert(ErrorCodes::FileNotOpen,
+            fmt::format("{} is not a named pipe", _pipeAbsolutePath),
+            S_ISFIFO(st.st_mode));
+
+    waitForWriter(deadline);
+    _isGood = true;
+    _isEof = false;
+    closeOnError.dismiss();
+
+    if (Clock::now() - start > stdx::chrono::seconds(1)) {
         LOGV2_WARNING(7184900,
                       "NamedPipeInput::doOpen() waited for pipe longer than 1 sec",
                       "_pipeAbsolutePath"_attr = _pipeAbsolutePath);
     }
 }
 
+void NamedPipeInput::waitForWriter(Clock::time_point deadline) {
+    while (true) {
+        // On a non-blocking FIFO, read() returns -1/EAGAIN when a writer is attached but has not
+        // written yet, data when it has, and 0 when no writer is attached.
+        char probe;
+        auto n = ::read(_fd, &probe, 1);
+        if (n == 1) {
+            _pendingByte = probe;
+            _hasPendingByte = true;
+            return;
+        }
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            uassert(ErrorCodes::FileNotOpen,
+                    fmt::format("error = {}",
+                                getLastSystemErrorMessageFormatted("read", _pipeAbsolutePath)),
+                    errno == EINTR);
+        }
+
+        if (n == 0) {
+#ifdef __linux__
+            // Linux reports POLLHUP on a FIFO only once a writer that attached after our open() has
+            // gone away, i.e. the writer closed without writing anything: an empty stream.
+            pollfd pfd{_fd, POLLIN, 0};
+            int rc = ::poll(&pfd, 1, std::min(kPollSliceMs, remainingMs(deadline)));
+            if (rc > 0 && (pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
+                return;
+            }
+#else
+            stdx::this_thread::sleep_for(
+                stdx::chrono::milliseconds(std::min(kPollSliceMs, remainingMs(deadline))));
+#endif
+        }
+
+        uassert(ErrorCodes::FileNotOpen,
+                fmt::format("No writer attached to named pipe {} within {} ms",
+                            _pipeAbsolutePath,
+                            kOpenTimeoutMs),
+                Clock::now() < deadline);
+        if (_checkForInterrupt) {
+            _checkForInterrupt();
+        }
+    }
+}
+
 int NamedPipeInput::doRead(char* data, int size) {
-    _ifs.read(data, size);
-    return _ifs.gcount();
+    if (_hasPendingByte) {
+        data[0] = _pendingByte;
+        _hasPendingByte = false;
+        return 1;
+    }
+
+    while (true) {
+        auto n = ::read(_fd, data, size);
+        if (n > 0) {
+            return static_cast<int>(n);
+        }
+        if (n == 0) {
+            _isEof = true;
+            _isGood = false;
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            _isGood = false;
+            return 0;
+        }
+
+        // The writer is attached but has no data yet. Wait in bounded slices so that an
+        // interrupted operation does not stay stuck on a silent writer.
+        pollfd pfd{_fd, POLLIN, 0};
+        ::poll(&pfd, 1, kPollSliceMs);
+        if (_checkForInterrupt) {
+            _checkForInterrupt();
+        }
+    }
 }
 
 void NamedPipeInput::doClose() {
-    _ifs.close();
+    if (_fd >= 0) {
+        ::close(_fd);
+    }
+    _fd = -1;
+    _isGood = false;
+    _isEof = false;
+    _hasPendingByte = false;
 }
 
 bool NamedPipeInput::isOpen() const {
-    return _ifs.is_open();
+    return _fd >= 0;
 }
 
 bool NamedPipeInput::isGood() const {
-    return _ifs.good();
+    return _isGood;
 }
 
 bool NamedPipeInput::isFailed() const {
-    return _ifs.fail();
+    return !_isGood;
 }
 
 bool NamedPipeInput::isEof() const {
-    return _ifs.eof();
+    return _isEof;
 }
 }  // namespace mongo
 #endif

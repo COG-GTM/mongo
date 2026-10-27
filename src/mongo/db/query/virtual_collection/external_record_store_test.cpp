@@ -55,10 +55,18 @@
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+
+#include <sys/stat.h>
+#endif
 
 namespace mongo {
 
@@ -241,11 +249,113 @@ TEST_F(ExternalRecordStoreTest, NamedPipeOpenNonExisting) {
         ErrorCodes::FileNotOpen);
 }
 
+#ifndef _WIN32
+namespace {
+std::string pipeDirPath(const std::string& relativePath) {
+    return std::string{kDefaultPipePath} + relativePath;
+}
+
+// Returns an interrupt check that throws Interrupted once it has been called 'limit' times.
+std::function<void()> interruptAfter(int limit, int* calls) {
+    return [limit, calls] {
+        uassert(ErrorCodes::Interrupted, "interrupted by test", ++*calls < limit);
+    };
+}
+}  // namespace
+
+TEST_F(ExternalRecordStoreTest, NamedPipeOpenWithoutWriterIsInterruptible) {
+    const std::string pipePath = "ERSTest_NamedPipeOpenWithoutWriterIsInterruptiblePipe";
+    ::unlink(pipeDirPath(pipePath).c_str());
+    ASSERT_EQ(::mkfifo(pipeDirPath(pipePath).c_str(), 0600), 0);
+    ON_BLOCK_EXIT([&] { ::unlink(pipeDirPath(pipePath).c_str()); });
+
+    int calls = 0;
+    auto start = stdx::chrono::steady_clock::now();
+    ASSERT_THROWS_CODE(
+        [&] {
+            (void)std::make_unique<InputStream<NamedPipeInput>>(pipePath,
+                                                                interruptAfter(3, &calls));
+        }(),
+        DBException,
+        ErrorCodes::Interrupted);
+    auto elapsed = stdx::chrono::steady_clock::now() - start;
+    ASSERT_LT(stdx::chrono::duration_cast<stdx::chrono::milliseconds>(elapsed).count(), 5000);
+}
+
+TEST_F(ExternalRecordStoreTest, NamedPipeReadFromSilentWriterIsInterruptible) {
+    const std::string pipePath = "ERSTest_NamedPipeReadFromSilentWriterIsInterruptiblePipe";
+    PipeWaiter created;
+    PipeWaiter readerDone;
+    stdx::thread producer([&] {
+        NamedPipeOutput pipeWriter(pipePath);
+        created.notify();
+        pipeWriter.open();
+        readerDone.wait();
+        pipeWriter.close();
+    });
+    ON_BLOCK_EXIT([&] {
+        readerDone.notify();
+        producer.join();
+    });
+    created.wait();
+
+    int calls = 0;
+    bool armed = false;
+    InputStream<NamedPipeInput> inputStream(pipePath, [&] {
+        if (armed) {
+            interruptAfter(3, &calls)();
+        }
+    });
+    armed = true;
+    ASSERT_THROWS_CODE(
+        inputStream.readBytes(kBufferSize, _buffer), DBException, ErrorCodes::Interrupted);
+}
+
+TEST_F(ExternalRecordStoreTest, NamedPipeOpenRejectsRegularFile) {
+    const std::string filePath = "ERSTest_NamedPipeOpenRejectsRegularFile";
+    {
+        std::ofstream ofs(pipeDirPath(filePath), std::ios::binary | std::ios::trunc);
+        auto obj = BSON("a" << 1);
+        ofs.write(obj.objdata(), obj.objsize());
+    }
+    ON_BLOCK_EXIT([&] { ::unlink(pipeDirPath(filePath).c_str()); });
+
+    ASSERT_THROWS_CODE(
+        [&] {
+            (void)std::make_unique<InputStream<NamedPipeInput>>(filePath);
+        }(),
+        DBException,
+        ErrorCodes::FileNotOpen);
+}
+
+TEST_F(ExternalRecordStoreTest, NamedPipeOpenRejectsSymlink) {
+    const std::string pipePath = "ERSTest_NamedPipeOpenRejectsSymlinkTarget";
+    const std::string linkPath = "ERSTest_NamedPipeOpenRejectsSymlinkLink";
+    ::unlink(pipeDirPath(pipePath).c_str());
+    ::unlink(pipeDirPath(linkPath).c_str());
+    ASSERT_EQ(::mkfifo(pipeDirPath(pipePath).c_str(), 0600), 0);
+    ASSERT_EQ(::symlink(pipeDirPath(pipePath).c_str(), pipeDirPath(linkPath).c_str()), 0);
+    ON_BLOCK_EXIT([&] {
+        ::unlink(pipeDirPath(linkPath).c_str());
+        ::unlink(pipeDirPath(pipePath).c_str());
+    });
+
+    ASSERT_THROWS_CODE(
+        [&] {
+            (void)std::make_unique<InputStream<NamedPipeInput>>(linkPath);
+        }(),
+        DBException,
+        ErrorCodes::FileNotOpen);
+}
+#endif
+
 // Test reading multiple pipes with a MultiBsonStreamCursor. In this test each pipe contains many
 // copies of a pipe-specific BSONObj, and everything in each pipe fits into a single read buffer.
 TEST_F(ExternalRecordStoreTest, NamedPipeMultiplePipes1) {
     const int kObjsPerPipe = 50;
-    std::vector<BSONObj> bsonObjs[kNumPipes] = {{BSON("a" << 1)}, {BSON("zed" << "two")}};
+    std::vector<BSONObj> bsonObjs[kNumPipes] = {{BSON("a" << 1)},
+                                                {BSON("zed"
+                                                      << "two")}};
 
     // Create two pipes. The first has only "a" objects and the second has only "zed" objects.
     stdx::thread pipeThreads[kNumPipes];
@@ -316,13 +426,20 @@ TEST_F(ExternalRecordStoreTest, NamedPipeMultiplePipes1) {
 // few million bsons to and from each pipe.
 TEST_F(ExternalRecordStoreTest, NamedPipeMultiplePipes2) {
     const std::vector<BSONObj> bsonObjs = {
-        BSON("One" << "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        BSON("Twofer" << "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-        BSON("field3" << "THREE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"),
-        BSON("four hundred forty-four" << "444444444444444444444444444444444444444444444444444444"),
-        BSON("5" << "five five five five five five five five five five five five five five five"),
-        BSON("Sixx" << "6666666666666666666666666666666666666666666666666666666666666666666666666"),
-        BSON("Lucky_Seven" << "777777777777777777777777777777777777777777777777777777777777777777"),
+        BSON("One"
+             << "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        BSON("Twofer"
+             << "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        BSON("field3"
+             << "THREE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"),
+        BSON("four hundred forty-four"
+             << "444444444444444444444444444444444444444444444444444444"),
+        BSON("5"
+             << "five five five five five five five five five five five five five five five"),
+        BSON("Sixx"
+             << "6666666666666666666666666666666666666666666666666666666666666666666666666"),
+        BSON("Lucky_Seven"
+             << "777777777777777777777777777777777777777777777777777777777777777777"),
     };
     const int numObjs = bsonObjs.size();
 

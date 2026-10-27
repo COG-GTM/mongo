@@ -50,7 +50,7 @@ ExternalRecordStore::ExternalRecordStore(boost::optional<UUID> uuid,
 std::unique_ptr<SeekableRecordCursor> ExternalRecordStore::getCursor(OperationContext* opCtx,
                                                                      bool forward) const {
     if (forward) {
-        return std::make_unique<MultiBsonStreamCursor>(getOptions());
+        return std::make_unique<MultiBsonStreamCursor>(getOptions(), opCtx);
     }
     tasserted(6968302, "MultiBsonStreamCursor does not support reverse scans");
     return nullptr;

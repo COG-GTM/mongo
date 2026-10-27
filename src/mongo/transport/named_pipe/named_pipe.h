@@ -30,6 +30,7 @@
 #pragma once
 
 #ifndef _WIN32
+#include <chrono>
 #include <fstream>
 #else
 #include <windows.h>
@@ -37,6 +38,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/transport/named_pipe/input_object.h"
 
+#include <functional>
 #include <string>
 
 namespace mongo {
@@ -78,7 +80,13 @@ private:
 
 class NamedPipeInput : public StreamableInput {
 public:
-    NamedPipeInput(const std::string& pipeRelativePath);
+    // Upper bound on how long doOpen() waits for the pipe to be created and for a writer to attach.
+    static constexpr int kOpenTimeoutMs = 31 * 1000;
+
+    // 'checkForInterrupt', if set, is called periodically while waiting for the pipe or for data
+    // and is expected to throw if the operation has been interrupted (e.g. by killOp).
+    NamedPipeInput(const std::string& pipeRelativePath,
+                   std::function<void()> checkForInterrupt = nullptr);
     ~NamedPipeInput() override;
     const std::string& getAbsolutePath() const override {
         return _pipeAbsolutePath;
@@ -95,8 +103,16 @@ protected:
 
 private:
     std::string _pipeAbsolutePath;
+    std::function<void()> _checkForInterrupt;
 #ifndef _WIN32
-    std::ifstream _ifs;
+    void waitForWriter(std::chrono::steady_clock::time_point deadline);
+
+    int _fd = -1;
+    bool _isGood = false;
+    bool _isEof = false;
+    // A byte consumed while probing for a writer in doOpen(), returned first by doRead().
+    bool _hasPendingByte = false;
+    char _pendingByte = 0;
 #else
     HANDLE _pipe;
     bool _isOpen : 1;

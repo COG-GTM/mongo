@@ -178,7 +178,11 @@ std::unique_ptr<InputStream<NamedPipeInput>> MultiBsonStreamCursor::getInputStre
     auto filePathStr =
         url.substr(filePathPos + ExternalDataSourceMetadata::kUrlProtocolFile.size());
 
-    return std::make_unique<InputStream<NamedPipeInput>>(filePathStr);
+    return std::make_unique<InputStream<NamedPipeInput>>(filePathStr, [this] {
+        if (_opCtx) {
+            _opCtx->checkForInterrupt();
+        }
+    });
 }
 
 /**
