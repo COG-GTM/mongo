@@ -85,12 +85,15 @@ void setAuditMetadata(OperationContext* opCtx,
                     "Unauthorized use of impersonation metadata.",
                     authzSession->isAuthorizedForClusterActions({ActionType::impersonate},
                                                                 boost::none));
+            uassert(ErrorCodes::BadValue,
+                    "$impersonatedRoles requires $impersonatedUser in impersonation metadata.",
+                    user || roles.empty());
 
             if (clientMetadata) {
                 setAuditClientMetadata(opCtx, clientMetadata.value(), clientSessionGuard);
             }
 
-            if (user || !roles.empty()) {
+            if (user) {
                 rpc::AuditUserAttrs::set(opCtx, *user, roles, true /* isImpersonating */);
             }
         }

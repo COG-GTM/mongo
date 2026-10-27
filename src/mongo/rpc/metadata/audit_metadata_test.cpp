@@ -261,6 +261,46 @@ TEST_F(AuditMetadataTest, ReadAuditMetadataClientOnly) {
     ASSERT_FALSE(auditUserAttrs);
 }
 
+TEST_F(AuditMetadataTest, ReadAuditMetadataRolesWithoutUserRejected) {
+    BSONObj dollarAudit =
+        BSON("$impersonatedRoles" << BSON_ARRAY(BSON("role" << kRoleName << "db" << kDBName)));
+    AuditMetadata parsedDollarAudit =
+        AuditMetadata::parse(IDLParserContext{kImpersonationMetadataSectionName}, dollarAudit);
+    ASSERT_FALSE(parsedDollarAudit.getUser());
+    GenericArguments requestArgs;
+    requestArgs.setDollarAudit(parsedDollarAudit);
+
+    boost::optional<rpc::ImpersonatedClientSessionGuard> clientSessionGuard;
+    ASSERT_THROWS_CODE(rpc::readRequestMetadata(opCtx(), requestArgs, false, clientSessionGuard),
+                       DBException,
+                       ErrorCodes::BadValue);
+
+    ASSERT_FALSE(clientSessionGuard);
+    ASSERT_FALSE(rpc::AuditUserAttrs::get(opCtx()));
+    ASSERT_FALSE(rpc::AuditClientAttrs::get(client()));
+}
+
+TEST_F(AuditMetadataTest, ReadAuditMetadataRolesAndClientWithoutUserRejected) {
+    BSONObj dollarAudit =
+        BSON("$impersonatedRoles" << BSON_ARRAY(BSON("role" << kRoleName << "db" << kDBName))
+                                  << "$impersonatedClient"
+                                  << BSON("hosts"
+                                          << BSON_ARRAY(kRemoteAddr << kLocalAddr << kProxyAddr)));
+    AuditMetadata parsedDollarAudit =
+        AuditMetadata::parse(IDLParserContext{kImpersonationMetadataSectionName}, dollarAudit);
+    GenericArguments requestArgs;
+    requestArgs.setDollarAudit(parsedDollarAudit);
+
+    boost::optional<rpc::ImpersonatedClientSessionGuard> clientSessionGuard;
+    ASSERT_THROWS_CODE(rpc::readRequestMetadata(opCtx(), requestArgs, false, clientSessionGuard),
+                       DBException,
+                       ErrorCodes::BadValue);
+
+    ASSERT_FALSE(clientSessionGuard);
+    ASSERT_FALSE(rpc::AuditUserAttrs::get(opCtx()));
+    ASSERT_FALSE(rpc::AuditClientAttrs::get(client()));
+}
+
 TEST_F(AuditMetadataTest, WriteAuditMetadata) {
     setUpTestData();
 
