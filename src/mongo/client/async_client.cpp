@@ -91,6 +91,15 @@ MONGO_FAIL_POINT_DEFINE(alwaysLogConnAcquisitionToWireTime)
 namespace {
 auto& totalTimeForEgressConnectionAcquiredToWireMicros =
     *MetricBuilder<Counter64>{"network.totalTimeForEgressConnectionAcquiredToWireMicros"};
+
+// Every request sent by AsyncDBClient is OP_MSG, so only an OP_MSG reply is valid.
+std::unique_ptr<rpc::ReplyInterface> makeOpMsgReply(const Message& response) {
+    uassert(ErrorCodes::RPCProtocolNegotiationFailed,
+            str::stream() << "Mismatched RPC protocols - request was '" << networkOpToString(dbMsg)
+                          << "' but reply was '" << networkOpToString(response.operation()) << "'",
+            response.operation() == dbMsg);
+    return rpc::makeReply(&response);
+}
 }  // namespace
 
 MONGO_FAIL_POINT_DEFINE(asyncConnectReturnsConnectionError);
@@ -415,7 +424,7 @@ Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
     }
 
     return std::move(responseFuture).then([this](Message response) mutable {
-        return rpc::UniqueReply(response, rpc::makeReply(&response));
+        return rpc::UniqueReply(response, makeOpMsgReply(response));
     });
 }
 
@@ -446,7 +455,7 @@ Future<executor::RemoteCommandResponse> AsyncDBClient::_continueReceiveExhaustRe
     return _waitForResponse(msgId, baton, token)
         .then([stopwatch, msgId, baton, this](Message responseMsg) mutable {
             bool isMoreToComeSet = OpMsg::isFlagSet(responseMsg, OpMsg::kMoreToCome);
-            rpc::UniqueReply response = rpc::UniqueReply(responseMsg, rpc::makeReply(&responseMsg));
+            rpc::UniqueReply response = rpc::UniqueReply(responseMsg, makeOpMsgReply(responseMsg));
             auto rcResponse =
                 executor::RemoteCommandResponse(_peer,
                                                 response->getCommandReply(),

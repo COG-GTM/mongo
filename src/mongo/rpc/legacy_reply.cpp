@@ -48,6 +48,12 @@ namespace rpc {
 LegacyReply::LegacyReply(const Message* message) {
     invariant(message->operation() == opReply);
 
+    constexpr int kMinReplySize = static_cast<int>(sizeof(QueryResult::Layout));
+    uassert(ErrorCodes::ProtocolError,
+            str::stream() << "Got legacy command reply that is too short: " << message->size()
+                          << " bytes, expected at least " << kMinReplySize,
+            message->size() >= kMinReplySize);
+
     QueryResult::View qr = message->singleData().view2ptr();
 
     // should be checked by caller.
@@ -68,6 +74,7 @@ LegacyReply::LegacyReply(const Message* message) {
                           << " expected a value of 0 but got " << qr.getStartingFrom(),
             qr.getStartingFrom() == 0);
 
+    invariant(qr.dataLen() >= 0);
     auto status = Validator<BSONObj>::validateLoad(qr.data(), qr.dataLen());
     uassert(ErrorCodes::InvalidBSON,
             str::stream() << "Got legacy command reply with invalid BSON in the metadata field"
