@@ -39,6 +39,7 @@
 #include <netinet/tcp.h>
 #endif
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/system_error.h"
 #include "mongo/config.h"
 #include "mongo/db/server_feature_flags_gen.h"
@@ -50,6 +51,8 @@
 #include "mongo/transport/asio/asio_tcp_fast_open.h"
 #include "mongo/transport/asio/asio_utils.h"
 #include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/session_util.h"
+#include "mongo/transport/transport_options.h"
 #include "mongo/transport/transport_options_gen.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/errno_util.h"
@@ -1003,6 +1006,20 @@ Status AsioTransportLayer::setup() {
     std::vector<int> ports = {_listenerPort};
     if (_listenerOptions.loadBalancerPort) {
         ports.push_back(*_listenerOptions.loadBalancerPort);
+
+        auto swTrustedSources = parseProxyProtocolTrustedSources(gProxyProtocolTrustedSources);
+        if (!swTrustedSources.isOK()) {
+            return swTrustedSources.getStatus();
+        }
+        _proxyProtocolTrustedSources = std::move(swTrustedSources.getValue());
+        if (_proxyProtocolTrustedSources.empty()) {
+            LOGV2_WARNING(10979300,
+                          "proxyProtocolTrustedSources is not set, so any peer that can reach the "
+                          "load-balancer port can spoof its source address with a proxy protocol "
+                          "header. Set proxyProtocolTrustedSources to the load balancer addresses "
+                          "or firewall the port to the load balancer",
+                          "loadBalancerPort"_attr = *_listenerOptions.loadBalancerPort);
+        }
     }
     if (auto port = _listenerOptions.routerPort) {
         ports.push_back(*port);
@@ -1154,6 +1171,8 @@ void AsioTransportLayer::appendStatsForServerStatus(BSONObjBuilder* bob) const {
     bob->append("listenerProcessingTime", _listenerProcessingTime.load().toBSON());
     bob->append("connsRejectedDueToMaxPendingProxyProtocolHeader",
                 _discardedDueToMaximumPendingOnProxyHeader.get());
+    bob->append("connsRejectedDueToUntrustedProxyProtocolSource",
+                _discardedDueToUntrustedProxySource.get());
 }
 
 void AsioTransportLayer::appendStatsForFTDC(BSONObjBuilder& bob) const {
@@ -1352,6 +1371,14 @@ AsioTransportLayer::_makeParseProxyTokenIfPossible() {
     });
 }
 
+bool AsioTransportLayer::_isTrustedProxyProtocolSource(const CommonAsioSession& session) const {
+    if (_proxyProtocolTrustedSources.empty()) {
+        return true;
+    }
+    return transport::util::isExemptedByCIDRList(
+        session.remoteAddr(), session.localAddr(), _proxyProtocolTrustedSources);
+}
+
 void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
     auto acceptCb = [this, &acceptor](const std::error_code& ec,
                                       AsioSession::GenericSocket peerSocket) mutable {
@@ -1392,6 +1419,23 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
             std::shared_ptr<AsioSession> session(
                 new SyncAsioSession(this, std::move(peerSocket), true));
             if (session->isConnectedToLoadBalancerPort()) {
+                // The proxy protocol header is unauthenticated, so only accept it from peers that
+                // are configured as trusted load balancers or reverse proxies.
+                if (!_isTrustedProxyProtocolSource(checked_cast<CommonAsioSession&>(*session))) {
+                    static logv2::SeveritySuppressor severitySuppressor{
+                        Seconds(10), logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
+                    _discardedDueToUntrustedProxySource.incrementRelaxed();
+                    LOGV2_DEBUG(10979301,
+                                severitySuppressor().toInt(),
+                                "Rejecting connection to the load-balancer port because the peer "
+                                "is not in proxyProtocolTrustedSources",
+                                "remote"_attr = session->remote(),
+                                "rejected"_attr = _discardedDueToUntrustedProxySource.get());
+                    session->end();
+                    _acceptConnection(acceptor);
+                    return;
+                }
+
                 // This session is not counted towards the number of accepted connections until the
                 // server receives the proxy header and moves the session to `SessionManager`.
                 // Therefore, the server may go above the ingress connection limits if it is waiting

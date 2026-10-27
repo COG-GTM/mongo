@@ -64,4 +64,27 @@ aren't expected behind a load balancer (as the load balancer will likely redirec
 to a different `mongos` instance upon reconnection), we eagerly [close cursors](https://github.com/mongodb/mongo/commit/b429d5dda98bbe18ab0851ffd1729d3b57fc8a4e) on load balanced
 client disconnects. We also [abort any in-progress transactions](https://github.com/mongodb/mongo/commit/74628ed4e314dfe0fd69d3fbae1411981a869f6b) that were initiated by the load balanced client.
 
+# Restricting which peers may send a proxy protocol header
+
+The proxy protocol header is plain, unauthenticated text, so `mongod` and `mongos` cannot verify
+the source address it advertises. That address is used for `maxIncomingConnectionsOverride`,
+`ingressConnectionEstablishmentRateLimiterBypass`, `ingressRequestRateLimiterExemptions`, audit
+client addresses and, when `clientSourceAuthenticationRestrictionMode` is `origin`,
+`authenticationRestrictions.clientSource` checks. Any peer that can reach the load-balancer port
+(`proxyPort` on `mongod`, `loadBalancerPort` on `mongos`) could otherwise claim to be any client.
+
+Set the startup-only server parameter `proxyProtocolTrustedSources` to the addresses of your load
+balancers or reverse proxies, as a comma-separated list of IP addresses or CIDR ranges:
+
+```
+mongos --setParameter loadBalancerPort=20100 \
+       --setParameter proxyProtocolTrustedSources=10.0.1.0/24,10.0.2.15
+```
+
+Connections to the load-balancer port whose TCP peer is not in the list are closed before the
+proxy protocol header is read, and counted in `serverStatus().network.connsRejectedDueToUntrustedProxyProtocolSource`.
+The regular port is not affected. If `proxyProtocolTrustedSources` is not set, every peer is
+trusted (the previous behavior), the server logs a startup warning, and the load-balancer port
+_must_ be firewalled so that only the load balancers can reach it.
+
 [proxy-protocol-url]: https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt

@@ -39,6 +39,8 @@
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/transport/transport_options_gen.h"
 
+#include <fmt/format.h>
+
 namespace mongo::transport {
 
 // TODO: SERVER-106468 Define CIDRRangeListParameter and remove this glue code
@@ -95,4 +97,24 @@ Status onUpdateEstablishmentMaxQueueDepth(int32_t newValue) {
         sm->getSessionEstablishmentRateLimiter().setMaxQueueDepth(newValue);
     });
 }
+
+StatusWith<CIDRList> parseProxyProtocolTrustedSources(const std::vector<std::string>& sources) {
+    CIDRList trusted;
+    for (const auto& source : sources) {
+        if (auto swCIDR = CIDR::parse(source); swCIDR.isOK()) {
+            trusted.emplace_back(std::in_place_type<CIDR>, std::move(swCIDR.getValue()));
+            continue;
+        }
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format("'{}' is not a valid CIDR range for proxyProtocolTrustedSources", source));
+    }
+    return trusted;
+}
+
+Status validateProxyProtocolTrustedSources(const std::vector<std::string>& sources,
+                                           const boost::optional<TenantId>&) {
+    return parseProxyProtocolTrustedSources(sources).getStatus();
+}
+
 }  // namespace mongo::transport

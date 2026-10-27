@@ -39,6 +39,7 @@
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/net/cidr.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_types.h"
@@ -82,6 +83,7 @@ extern FailPoint asioTransportLayerHangDuringAcceptCallback;
 class AsioNetworkingBaton;
 class AsioReactor;
 class AsioSession;
+class CommonAsioSession;
 
 /**
  * A TransportLayer implementation based on ASIO networking primitives.
@@ -287,6 +289,8 @@ private:
 
     void _acceptConnection(GenericAcceptor& acceptor);
 
+    bool _isTrustedProxyProtocolSource(const CommonAsioSession& session) const;
+
     template <typename Endpoint>
     StatusWith<std::shared_ptr<AsioSession>> _doSyncConnect(
         Endpoint endpoint,
@@ -389,6 +393,14 @@ private:
     // Counts the aggregate number of proxy connections that were dropped due to the server reaching
     // the maximum number of proxy connections pending proxy protocol header.
     Counter64 _discardedDueToMaximumPendingOnProxyHeader;
+
+    // Peers allowed to send a proxy protocol header to the load-balancer port, parsed from
+    // `proxyProtocolTrustedSources` during setup. Empty means every peer is trusted.
+    CIDRList _proxyProtocolTrustedSources;
+
+    // Counts the aggregate number of load-balancer port connections that were dropped because the
+    // TCP peer is not in `proxyProtocolTrustedSources`.
+    Counter64 _discardedDueToUntrustedProxySource;
 };
 
 }  // namespace transport
