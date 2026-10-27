@@ -127,6 +127,16 @@ TEST(ProxyProtocolHeaderParser, MalformedIpv4Addresses) {
                               "1.1..1.1",
                               "-0.1.1.1",
                               "-1.1.1.1",
+                              "+1.2.3.4",
+                              "1.2.3.+4",
+                              "08.1.1.1",
+                              "001.1.1.1",
+                              "010.1.1.1",
+                              "1.1.1.00",
+                              "1.1.1.01",
+                              "0x1.1.1.1",
+                              " 1.1.1.1",
+                              "1.1.1.1 ",
                               ""};
 
     for (const auto& testCase : testCases) {
@@ -176,6 +186,13 @@ TEST(ProxyProtocolHeaderParser, MalformedIpv6Addresses) {
                               "::-100",
                               ":0000::",
                               ":::",
+                              "0x12:0x12:0x12:0x12:0x12:0x12:0x12:0x12",
+                              "0X12::",
+                              "+abc::",
+                              "::+abc",
+                              "0000:0000:0000:0000:0000:0000:0000:0x12",
+                              " 000::",
+                              "000 ::",
                               ""};
 
     for (const auto& testCase : testCases) {
@@ -244,6 +261,11 @@ TEST(ProxyProtocolHeaderParser, MalformedV1Headers) {
         {"PROXY TCP4 128 28000000000000 10 10\r\n", "malformed IPv4"},
         {"PROXY TCP4 1.1.1.1 notanip 10 300\r\n", "malformed IPv4"},
         {"PROXY TCP4 a:b:c:d 20 10 300\r\n", "malformed IPv4"},
+        // Addresses that are not numeric hosts must be rejected before SockAddr resolution,
+        // which would otherwise fall back to a blocking DNS lookup.
+        {"PROXY TCP4 08.1.1.1 1.1.1.1 1 1\r\n", "malformed IPv4"},
+        {"PROXY TCP4 1.1.1.1 +1.2.3.4 1 1\r\n", "malformed IPv4"},
+        {"PROXY TCP4 001.1.1.1 1.1.1.1 1 1\r\n", "malformed IPv4"},
         {"PROXY TCP4 1.1.1.1 1.1.1.1 -10 300\r\n", "Negative"},
         {"PROXY TCP4 1.1.1.1 1.1.1.1 10 -300\r\n", "Negative"},
         {"PROXY TCP4 1.1.1.1 2.2.2.2 notaport 10\r\n", "Did not consume"},
@@ -259,6 +281,8 @@ TEST(ProxyProtocolHeaderParser, MalformedV1Headers) {
         {"PROXY TCP6 :: :: -10 10\r\n", "Negative"},
         {"PROXY TCP6 :: :: 10 -10\r\n", "Negative"},
         {"PROXY TCP6 :: notanip 10 300\r\n", "malformed IPv6"},
+        {"PROXY TCP6 0x12:0x12:0x12:0x12:0x12:0x12:0x12:0x12 :: 1 1\r\n", "malformed IPv6"},
+        {"PROXY TCP6 :: +abc:: 1 1\r\n", "malformed IPv6"},
         {"PROXY TCP6 :: :: notaport 10\r\n", "Did not consume"},
         {"PROXY TCP6 :: :: 10 20garbage\r\n", "Did not consume"}};
 
