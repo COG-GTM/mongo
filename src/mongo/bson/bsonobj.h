@@ -1017,7 +1017,7 @@ struct DataType::Handler<BSONObj> {
                                       length,
                                       debug_offset));
         }
-        const auto declaredSize = ConstDataView(ptr).read<LittleEndian<int32_t>>();
+        const int32_t declaredSize = ConstDataView(ptr).read<LittleEndian<int32_t>>();
         if (declaredSize < 0 || static_cast<size_t>(declaredSize) > length) {
             return Status(ErrorCodes::InvalidBSON,
                           fmt::format("BSON object size {} exceeds the {} bytes available at "
