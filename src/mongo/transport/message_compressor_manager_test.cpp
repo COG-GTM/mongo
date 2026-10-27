@@ -262,6 +262,45 @@ TEST(MessageCompressorManager, FullNormalCompression) {
     clientManager.clientFinish(serverObj);
 }
 
+TEST(MessageCompressorManager, ClientFinishIgnoresUnknownCompressor) {
+    auto registry = buildRegistry();
+    MessageCompressorManager clientManager(&registry);
+
+    BSONObjBuilder clientOutput;
+    clientManager.clientBegin(&clientOutput);
+
+    clientManager.clientFinish(BSON("compression" << BSON_ARRAY("bogus")));
+    ASSERT_TRUE(clientManager.getNegotiatedCompressors().empty());
+
+    auto toSend = buildMessage();
+    auto sent = assertOk(clientManager.compressMessage(toSend, nullptr));
+    ASSERT_EQ(sent.operation(), toSend.operation());
+    ASSERT_EQ(sent.size(), toSend.size());
+}
+
+TEST(MessageCompressorManager, ClientFinishKeepsKnownCompressorsAlongsideUnknown) {
+    auto registry = buildRegistry();
+    MessageCompressorManager clientManager(&registry);
+    MessageCompressorManager serverManager(&registry);
+
+    BSONObjBuilder clientOutput;
+    clientManager.clientBegin(&clientOutput);
+
+    clientManager.clientFinish(BSON("compression" << BSON_ARRAY("bogus" << "noop")));
+    const auto& negotiated = clientManager.getNegotiatedCompressors();
+    ASSERT_EQ(negotiated.size(), 1U);
+    ASSERT_TRUE(negotiated[0] != nullptr);
+    ASSERT_EQ(negotiated[0]->getName(), "noop");
+
+    auto toSend = buildMessage();
+    auto compressed = assertOk(clientManager.compressMessage(toSend, nullptr));
+    ASSERT_EQ(compressed.operation(), dbCompressed);
+    MessageCompressorId compressorId;
+    auto recvd = assertOk(serverManager.decompressMessage(compressed, &compressorId));
+    ASSERT_EQ(compressorId, negotiated[0]->getId());
+    ASSERT_EQ(recvd.size(), toSend.size());
+}
+
 TEST(NoopMessageCompressor, Fidelity) {
     auto testMessage = buildMessage();
     checkFidelity(testMessage, std::make_unique<NoopMessageCompressor>());
