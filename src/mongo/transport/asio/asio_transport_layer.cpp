@@ -1343,20 +1343,16 @@ bool isTcp(Protocol&& p) {
 std::unique_ptr<AsioTransportLayer::TokenType>
 AsioTransportLayer::_makeParseProxyTokenIfPossible() {
     // Pending proxy connections hold a socket without being counted by the `SessionManager`, so
-    // they must also fit within its file descriptor based session limit (see `getSupportedMax`).
-    std::size_t openSessions = 0;
-    std::size_t maxOpenSessions = std::numeric_limits<std::size_t>::max();
-    if (_sessionManager) {
-        openSessions = _sessionManager->numOpenSessions();
-        maxOpenSessions = _sessionManager->maxOpenSessions();
-    }
+    // they are also bounded by its file descriptor based session limit (see `getSupportedMax`).
+    // Open sessions are deliberately not subtracted: clients exempted by
+    // `maxIncomingConnectionsOverride` are only identified once the header is parsed, and must
+    // still be able to connect through the proxy when the session limit has been reached.
+    const auto maxOpenSessions = _sessionManager ? _sessionManager->maxOpenSessions()
+                                                 : std::numeric_limits<std::size_t>::max();
 
     stdx::lock_guard lk(_mutex);
-    if (_numConnectionsPendingProxyHeader >= gProxyProtocolMaximumPendingConnections.load()) {
-        return {};
-    }
-    const auto pending = static_cast<std::size_t>(_numConnectionsPendingProxyHeader);
-    if (openSessions >= maxOpenSessions || pending >= maxOpenSessions - openSessions) {
+    if (_numConnectionsPendingProxyHeader >= gProxyProtocolMaximumPendingConnections.load() ||
+        static_cast<std::size_t>(_numConnectionsPendingProxyHeader) >= maxOpenSessions) {
         return {};
     }
     ++_numConnectionsPendingProxyHeader;
@@ -1412,8 +1408,8 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                 // to receive the proxy header for many accepted connections.
                 // Thus, the server limits the number of connections received on the proxy port that
                 // are yet to provide the proxy header, both by
-                // `proxyProtocolMaximumPendingConnections` and by the capacity left under the
-                // `SessionManager` limit on open sessions.
+                // `proxyProtocolMaximumPendingConnections` and by the `SessionManager` limit on
+                // open sessions.
                 auto token = _makeParseProxyTokenIfPossible();
                 if (MONGO_unlikely(!token)) {
                     static logv2::SeveritySuppressor severitySuppressor{
@@ -1426,7 +1422,6 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                         "pending on proxy protocol header",
                         "remote"_attr = session->remote(),
                         "limit"_attr = gProxyProtocolMaximumPendingConnections.loadRelaxed(),
-                        "openSessions"_attr = _sessionManager->numOpenSessions(),
                         "maxOpenSessions"_attr = _sessionManager->maxOpenSessions(),
                         "rejected"_attr = _discardedDueToMaximumPendingOnProxyHeader.get());
                     _acceptConnection(acceptor);
