@@ -29,6 +29,8 @@
 
 #include "mongo/transport/grpc/grpc_session.h"
 
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
 #include "mongo/base/error_codes.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/message.h"
@@ -40,6 +42,7 @@
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 
+#include <cstring>
 #include <memory>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -394,6 +397,121 @@ TEST_F(GRPCSessionTest, EgressPhysicalMetrics) {
     ASSERT_EQ(egressDiff.physicalBytesIn, resp.size());
     ASSERT_EQ(egressDiff.physicalBytesOut, req.size());
     ASSERT_EQ(egressDiff.numRequests, 0);
+}
+
+/**
+ * Builds a buffer of exactly `size` bytes whose wire protocol header claims `claimedLength`
+ * bytes, followed by OP_MSG flags when there is room for them.
+ */
+SharedBuffer makeRawMessageBuffer(size_t size, int32_t claimedLength, uint32_t flags = 0) {
+    auto buffer = SharedBuffer::allocate(size);
+    std::memset(buffer.get(), 0, size);
+    if (size >= static_cast<size_t>(MsgData::MsgDataHeaderSize)) {
+        MsgData::View view(buffer.get());
+        view.setLen(claimedLength);
+        view.setId(nextMessageId());
+        view.setResponseToMsgId(0);
+        view.setOperation(dbMsg);
+    }
+    if (size >= MsgData::MsgDataHeaderSize + sizeof(flags)) {
+        DataView(buffer.get() + MsgData::MsgDataHeaderSize).write<LittleEndian<uint32_t>>(flags);
+    }
+    return buffer;
+}
+
+struct InvalidMessageCase {
+    std::string description;
+    Message message;
+};
+
+std::vector<InvalidMessageCase> makeInvalidMessageCases() {
+    // A 21 byte OP_MSG whose header claims 48 MB and whose flags say a checksum is present.
+    auto lyingLength = makeRawMessageBuffer(21, 48'000'000, OpMsg::kChecksumPresent);
+    return {
+        {"empty message", Message()},
+        {"shorter than the header", Message(makeRawMessageBuffer(10, 10))},
+        {"length larger than received", Message(std::move(lyingLength))},
+        {"length smaller than the header", Message(makeRawMessageBuffer(21, 8))},
+        {"negative length", Message(makeRawMessageBuffer(21, -1))},
+    };
+}
+
+TEST_F(GRPCSessionTest, IngressRejectsInvalidMessageLength) {
+    for (auto& testCase : makeInvalidMessageCases()) {
+        LOGV2(10984302, "Sending invalid message to ingress", "case"_attr = testCase.description);
+        auto ingressSession = makeSession<IngressSession>();
+        auto egressSession = makeSession<EgressSession>();
+        ON_BLOCK_EXIT([&] {
+            ingressSession->end();
+            egressSession->end();
+        });
+
+        ASSERT_OK(egressSession->sinkMessage(testCase.message));
+        ASSERT_EQ(ingressSession->sourceMessage().getStatus(), ErrorCodes::ProtocolError);
+        ASSERT_EQ(ingressSession->terminationStatus()->code(), ErrorCodes::ProtocolError);
+
+        // The session stays terminated and refuses to read anything further.
+        ASSERT_NOT_OK(ingressSession->sourceMessage().getStatus());
+    }
+}
+
+TEST_F(GRPCSessionTest, EgressRejectsInvalidMessageLength) {
+    for (auto& testCase : makeInvalidMessageCases()) {
+        LOGV2(10984303, "Sending invalid message to egress", "case"_attr = testCase.description);
+        auto ingressSession = makeSession<IngressSession>();
+        auto egressSession = makeSession<EgressSession>();
+        ON_BLOCK_EXIT([&] {
+            ingressSession->end();
+            egressSession->end();
+        });
+
+        ASSERT_OK(ingressSession->sinkMessage(testCase.message));
+        ASSERT_EQ(egressSession->sourceMessage().getStatus(), ErrorCodes::ProtocolError);
+        ASSERT_EQ(egressSession->terminationStatus()->code(), ErrorCodes::ProtocolError);
+        ASSERT_EQ(egressSession->finish(), ErrorCodes::ProtocolError);
+    }
+}
+
+TEST_F(GRPCSessionTest, IngressRejectsLengthLargerThanMaxMessageSize) {
+    auto ingressSession = makeSession<IngressSession>();
+    auto egressSession = makeSession<EgressSession>();
+    ON_BLOCK_EXIT([&] {
+        ingressSession->end();
+        egressSession->end();
+    });
+
+    // The buffer is large enough to hold the claimed length, so only the maximum size is violated.
+    const auto claimedLength = static_cast<int32_t>(MaxMessageSizeBytes + 1);
+    auto msg = Message(makeRawMessageBuffer(claimedLength + 16, claimedLength));
+    ASSERT_OK(egressSession->sinkMessage(msg));
+    ASSERT_EQ(ingressSession->sourceMessage().getStatus(), ErrorCodes::ProtocolError);
+}
+
+TEST_F(GRPCSessionTest, AcceptsMessageWithTrailingBytes) {
+    auto ingressSession = makeSession<IngressSession>();
+    auto egressSession = makeSession<EgressSession>();
+    ON_BLOCK_EXIT([&] {
+        ingressSession->end();
+        egressSession->end();
+    });
+
+    // gRPC transmits the whole capacity of the sender's buffer, so the header may claim fewer bytes
+    // than were received. The trailing bytes must be ignored.
+    auto sendPadded = [&](Session& sender, Session& receiver) {
+        auto msg = makeUniqueMessage("message with trailing bytes");
+        auto padded = SharedBuffer::allocate(msg.size() + 64);
+        std::memset(padded.get(), 0xff, padded.capacity());
+        std::memcpy(padded.get(), msg.buf(), msg.size());
+
+        ASSERT_OK(sender.sinkMessage(Message(std::move(padded))));
+        auto swReceived = receiver.sourceMessage();
+        ASSERT_OK(swReceived.getStatus());
+        ASSERT_EQ(swReceived.getValue().size(), msg.size());
+        ASSERT_EQ_MSG(swReceived.getValue(), msg);
+    };
+
+    sendPadded(*egressSession, *ingressSession);
+    sendPadded(*ingressSession, *egressSession);
 }
 
 enum class Operation { kSink, kSource };
