@@ -105,16 +105,9 @@ StatusWith<CIDRList> parseProxyProtocolTrustedSources(const std::vector<std::str
             trusted.emplace_back(std::in_place_type<CIDR>, std::move(swCIDR.getValue()));
             continue;
         }
-#ifndef _WIN32
-        if (!source.empty() && source.front() == '/') {
-            trusted.emplace_back(std::in_place_type<std::string>, source);
-            continue;
-        }
-#endif
-        return Status(ErrorCodes::BadValue,
-                      fmt::format("'{}' is not a valid CIDR range or Unix domain socket path for "
-                                  "proxyProtocolTrustedSources",
-                                  source));
+        return Status(
+            ErrorCodes::BadValue,
+            fmt::format("'{}' is not a valid CIDR range for proxyProtocolTrustedSources", source));
     }
     return trusted;
 }

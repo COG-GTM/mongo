@@ -160,12 +160,12 @@ server_parameters:
 
     proxyProtocolTrustedSources:
         description: >-
-            CIDR ranges (and, on non-Windows platforms, Unix domain socket paths) of the load
-            balancers or reverse proxies that are allowed to send a proxy protocol header to the
-            load-balancer port (mongos `loadBalancerPort`, mongod `proxyPort`). Connections to
-            that port whose TCP peer address is not in this list are closed before the proxy
-            protocol header is read, so an untrusted peer cannot spoof the client source address.
-            When empty, every peer is trusted and the port must be firewalled to the load balancer.
+            IP addresses or CIDR ranges of the load balancers or reverse proxies that are allowed
+            to send a proxy protocol header to the load-balancer port (mongos `loadBalancerPort`,
+            mongod `proxyPort`). Connections to that port whose TCP peer address is not in this
+            list are closed before the proxy protocol header is read, so an untrusted peer cannot
+            spoof the client source address. When empty, every peer is trusted and the port must
+            be firewalled to the load balancer.
         set_at: startup
         cpp_varname: gProxyProtocolTrustedSources
         cpp_vartype: "std::vector<std::string>"

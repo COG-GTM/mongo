@@ -45,8 +45,7 @@ Status onUpdateEstablishmentBurstCapacitySecs(double newValue);
 Status onUpdateEstablishmentMaxQueueDepth(int32_t newValue);
 
 /**
- * Parses `proxyProtocolTrustedSources` entries. Each entry must be a CIDR range or, on non-Windows
- * platforms, an absolute Unix domain socket path.
+ * Parses `proxyProtocolTrustedSources` entries. Each entry must be an IP address or CIDR range.
  */
 StatusWith<CIDRList> parseProxyProtocolTrustedSources(const std::vector<std::string>& sources);
 

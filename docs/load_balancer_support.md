@@ -74,8 +74,7 @@ client addresses and, when `clientSourceAuthenticationRestrictionMode` is `origi
 (`proxyPort` on `mongod`, `loadBalancerPort` on `mongos`) could otherwise claim to be any client.
 
 Set the startup-only server parameter `proxyProtocolTrustedSources` to the addresses of your load
-balancers or reverse proxies, as a comma-separated list of CIDR ranges (Unix domain socket paths
-are also accepted on non-Windows platforms):
+balancers or reverse proxies, as a comma-separated list of IP addresses or CIDR ranges:
 
 ```
 mongos --setParameter loadBalancerPort=20100 \
