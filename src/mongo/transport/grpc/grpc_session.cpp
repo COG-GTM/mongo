@@ -33,14 +33,54 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/rpc/message.h"
 #include "mongo/transport/grpc/util.h"
 #include "mongo/util/base64.h"
 
+#include <algorithm>
 #include <charconv>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo::transport::grpc {
+namespace {
+
+/**
+ * Wraps a buffer received from a gRPC stream in a Message after checking that the messageLength in
+ * its wire protocol header fits within the bytes that actually arrived. Every consumer of the
+ * Message (OP_MSG parsing, checksum validation, decompression) sizes its reads from that header.
+ *
+ * The header may claim fewer bytes than were received, since the gRPC serializer sends the full
+ * capacity of the sender's buffer, which can include unused trailing space.
+ */
+StatusWith<Message> makeMessageFromReceivedBuffer(SharedBuffer buffer) {
+    constexpr size_t kHeaderSize = MsgData::MsgDataHeaderSize;
+    const size_t received = buffer.capacity();
+    if (received < kHeaderSize) {
+        return Status(ErrorCodes::ProtocolError,
+                      fmt::format("Received a {} byte gRPC message, which is smaller than the {} "
+                                  "byte wire protocol header",
+                                  received,
+                                  kHeaderSize));
+    }
+
+    const int32_t msgLen = MsgData::ConstView(buffer.get()).getLen();
+    if (msgLen < static_cast<int32_t>(kHeaderSize) ||
+        static_cast<size_t>(msgLen) > MaxMessageSizeBytes ||
+        static_cast<size_t>(msgLen) > received) {
+        return Status(ErrorCodes::ProtocolError,
+                      fmt::format("Received a {} byte gRPC message with an invalid messageLength "
+                                  "of {}. Min: {}, Max: {}",
+                                  received,
+                                  msgLen,
+                                  kHeaderSize,
+                                  std::min(received, MaxMessageSizeBytes)));
+    }
+
+    return Message(std::move(buffer));
+}
+
+}  // namespace
 
 GRPCSession::GRPCSession(TransportLayer* tl, HostAndPort remote)
     : _tl(tl), _remote(std::move(remote)) {
@@ -175,9 +215,20 @@ IngressSession::~IngressSession() {
 
 StatusWith<Message> IngressSession::_readFromStream() {
     if (auto maybeBuffer = _stream->read()) {
+        const auto received = maybeBuffer->capacity();
+        auto swMessage = makeMessageFromReceivedBuffer(std::move(*maybeBuffer));
+        if (!swMessage.isOK()) {
+            networkCounter.hitPhysicalIn(NetworkCounter::ConnectionType::kIngress, received);
+            LOGV2(10984300,
+                  "Terminating gRPC ingress session after receiving an invalid message",
+                  "session"_attr = toBSON(),
+                  "error"_attr = swMessage.getStatus());
+            _setTerminationStatus(swMessage.getStatus());
+            return swMessage.getStatus();
+        }
         networkCounter.hitPhysicalIn(NetworkCounter::ConnectionType::kIngress,
-                                     MsgData::ConstView(maybeBuffer->get()).getLen());
-        return Message(std::move(*maybeBuffer));
+                                     swMessage.getValue().size());
+        return swMessage;
     }
 
     if (auto ts = terminationStatus()) {
@@ -287,11 +338,24 @@ Future<Message> EgressSession::_asyncReadFromStream() {
                     : termStatus;
             });
         })
-        .then([this, msg = std::move(msg)]() {
+        .then([this, msg = std::move(msg)]() -> StatusWith<Message> {
             _updateWireVersion();
+            const auto received = msg->capacity();
+            auto swMessage = makeMessageFromReceivedBuffer(std::move(*msg));
+            if (!swMessage.isOK()) {
+                networkCounter.hitPhysicalIn(NetworkCounter::ConnectionType::kEgress, received);
+                LOGV2(10984301,
+                      "Terminating gRPC egress session after receiving an invalid message",
+                      "session"_attr = toBSON(),
+                      "error"_attr = swMessage.getStatus());
+                if (_setTerminationStatus(swMessage.getStatus())) {
+                    _tryCancel();
+                }
+                return swMessage.getStatus();
+            }
             networkCounter.hitPhysicalIn(NetworkCounter::ConnectionType::kEgress,
-                                         MsgData::ConstView(msg->get()).getLen());
-            return Message(std::move(*msg));
+                                         swMessage.getValue().size());
+            return swMessage;
         });
 }
 
