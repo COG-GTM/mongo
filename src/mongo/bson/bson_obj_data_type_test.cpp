@@ -69,4 +69,22 @@ TEST(BSONObjDataType, ConstDataTypeRangeBSON) {
     ASSERT_EQUALS(3, cdrc.readAndAdvance<BSONObj>().getField("c").numberInt());
 }
 
+TEST(BSONObjDataType, LoadRejectsObjectLargerThanRange) {
+    BSONObj obj = BSON("a" << 1);
+
+    ConstDataRangeCursor truncated(obj.objdata(), obj.objdata() + obj.objsize() - 1);
+    BSONObj out;
+    auto status = truncated.readAndAdvanceNoThrow(&out);
+    ASSERT_EQ(status.code(), ErrorCodes::InvalidBSON);
+    ASSERT_EQ(truncated.length(), static_cast<size_t>(obj.objsize() - 1));
+
+    ConstDataRangeCursor noSize(obj.objdata(), obj.objdata() + 3);
+    ASSERT_EQ(noSize.readAndAdvanceNoThrow(&out).code(), ErrorCodes::InvalidBSON);
+
+    ConstDataRangeCursor exact(obj.objdata(), obj.objdata() + obj.objsize());
+    ASSERT_OK(exact.readAndAdvanceNoThrow(&out));
+    ASSERT_BSONOBJ_EQ(out, obj);
+    ASSERT_EQ(exact.length(), 0u);
+}
+
 }  // namespace mongo

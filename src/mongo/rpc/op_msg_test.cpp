@@ -56,6 +56,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/tenant_id.h"
@@ -458,6 +459,135 @@ TEST_F(OpMsgParser, FailsIfDocumentInSequenceTooBig) {
     };
 
     ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+// With net.wireObjectCheck disabled, the parser must still bound each BSON object by the bytes
+// remaining in the message and throw instead of advancing past the end of the buffer.
+class OpMsgParserNoObjCheck : public OpMsgParser {
+public:
+    OpMsgParserNoObjCheck() : _savedObjCheck(serverGlobalParams.objcheck) {
+        serverGlobalParams.objcheck = false;
+    }
+    ~OpMsgParserNoObjCheck() override {
+        serverGlobalParams.objcheck = _savedObjCheck;
+    }
+
+private:
+    const bool _savedObjCheck;
+};
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfBodyTooBig) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .addToSize(-1);  // Shrink message so body extends past end.
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfBodyTooBigIntoChecksum) {
+    auto msg =
+        OpMsgBytes{
+            kHaveChecksum,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+        }
+            .appendChecksum()
+            .addToSize(-1);  // Shrink message so body extends past end.
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfBodyDeclaresSizeLargerThanMessage) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        int32_t{1000},  // Declared BSON size, far larger than the bytes that follow.
+        int32_t{0},
+        int32_t{0},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfBodyHasNoRoomForSize) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        char{5},  // Only 2 of the 4 size bytes are present.
+        char{0},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfBodyDeclaresNegativeSize) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        int32_t{-1},
+        int32_t{0},
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfDocumentInSequenceTooBig) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{
+            "docs",  //
+            fromjson("{a: 1}"),
+        }
+            .addToSize(-1),  // Shrink sequence so document extends past end.
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, FailsIfDocumentInSequenceDeclaresSizeLargerThanSequence) {
+    auto msg = OpMsgBytes{
+        kNoFlags,  //
+        kBodySection,
+        fromjson("{ping: 1}"),
+
+        kDocSequenceSection,
+        Sized{
+            "docs",  //
+            int32_t{1000},
+            int32_t{0},
+        },
+    };
+
+    ASSERT_THROWS_CODE(msg.parse(), AssertionException, ErrorCodes::InvalidBSON);
+}
+
+TEST_F(OpMsgParserNoObjCheck, SucceedsWithBodyThenSequence) {
+    auto msg =
+        OpMsgBytes{
+            kNoFlags,  //
+            kBodySection,
+            fromjson("{ping: 1}"),
+
+            kDocSequenceSection,
+            Sized{
+                "docs",  //
+                fromjson("{a: 1}"),
+                fromjson("{a: 2}"),
+            },
+        }
+            .parse();
+
+    ASSERT_BSONOBJ_EQ(msg.body, fromjson("{ping: 1}"));
+    ASSERT_EQ(msg.sequences.size(), 1u);
+    ASSERT_EQ(msg.sequences[0].objs.size(), 2u);
 }
 
 TEST_F(OpMsgParser, FailsIfNameOfDocumentSequenceTooBig) {
