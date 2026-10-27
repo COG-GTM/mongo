@@ -37,6 +37,7 @@
 #include "mongo/transport/grpc/util.h"
 #include "mongo/transport/test_fixtures.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/base64.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 
@@ -70,6 +71,15 @@ public:
                                                 std::move(remoteClientId),
                                                 /* auth token */ boost::none,
                                                 /* client metadata */ boost::none);
+    }
+
+    std::unique_ptr<IngressSession> makeIngressSessionWithMetadata(StringData encodedMetadata) {
+        return std::make_unique<IngressSession>(nullptr,
+                                                _streamFixtures->rpc->serverCtx.get(),
+                                                _streamFixtures->rpc->serverStream.get(),
+                                                /* remote client id */ boost::none,
+                                                /* auth token */ boost::none,
+                                                encodedMetadata);
     }
 
     std::unique_ptr<EgressSession> makeEgressSession(UUID clientId) {
@@ -197,6 +207,93 @@ private:
 TEST_F(GRPCSessionTest, NoClientId) {
     auto session = makeIngressSession(boost::none);
     ASSERT_FALSE(session->getRemoteClientId());
+    session->end();
+}
+
+namespace {
+void appendLE32(std::string& out, int32_t value) {
+    for (int i = 0; i < 4; ++i) {
+        out.push_back(static_cast<char>((static_cast<uint32_t>(value) >> (8 * i)) & 0xFF));
+    }
+}
+}  // namespace
+
+TEST_F(GRPCSessionTest, ValidClientMetadata) {
+    const BSONObj metadataDoc = makeClientMetadataDocument();
+    const auto encoded = base64::encode(StringData(metadataDoc.objdata(), metadataDoc.objsize()));
+    auto session = makeIngressSessionWithMetadata(encoded);
+    ASSERT_TRUE(session->getClientMetadata());
+    ASSERT_BSONOBJ_EQ(session->getClientMetadata()->getDocument(), metadataDoc);
+    session->end();
+}
+
+TEST_F(GRPCSessionTest, EmptyClientMetadataIsRejected) {
+    auto session = makeIngressSessionWithMetadata(""_sd);
+    ASSERT_THROWS_CODE(session->getClientMetadata(), DBException, ErrorCodes::InvalidBSON);
+    session->end();
+}
+
+TEST_F(GRPCSessionTest, TruncatedClientMetadataIsRejected) {
+    // Declares a 1024 byte document but only 8 bytes are actually provided.
+    std::string raw;
+    appendLE32(raw, 1024);
+    raw.append(4, '\0');
+    const auto encoded = base64::encode(raw);
+    auto session = makeIngressSessionWithMetadata(encoded);
+    ASSERT_THROWS_CODE(session->getClientMetadata(), DBException, ErrorCodes::InvalidBSON);
+    session->end();
+}
+
+TEST_F(GRPCSessionTest, ClientMetadataWithOversizedStringIsRejected) {
+    // {driver: {name: <string whose length field claims 0x7FFFFFFF bytes>}}
+    std::string driver;
+    driver.push_back(static_cast<char>(BSONType::string));
+    driver.append("name", 5);
+    appendLE32(driver, 0x7FFFFFFF);
+    driver.append("x", 2);
+    driver.push_back('\0');
+
+    std::string driverDoc;
+    appendLE32(driverDoc, static_cast<int32_t>(4 + driver.size()));
+    driverDoc += driver;
+
+    std::string body;
+    body.push_back(static_cast<char>(BSONType::object));
+    body.append("driver", 7);
+    body += driverDoc;
+    body.push_back('\0');
+
+    std::string raw;
+    appendLE32(raw, static_cast<int32_t>(4 + body.size()));
+    raw += body;
+
+    const auto encoded = base64::encode(raw);
+    auto session = makeIngressSessionWithMetadata(encoded);
+    ASSERT_THROWS_CODE(session->getClientMetadata(), DBException, ErrorCodes::InvalidBSON);
+    session->end();
+}
+
+TEST_F(GRPCSessionTest, ClientMetadataWithTrailingBytesIsRejected) {
+    const BSONObj metadataDoc = makeClientMetadataDocument();
+    std::string raw(metadataDoc.objdata(), metadataDoc.objsize());
+    raw.append(8, '\0');
+    const auto encoded = base64::encode(raw);
+    auto session = makeIngressSessionWithMetadata(encoded);
+    ASSERT_THROWS_CODE(session->getClientMetadata(), DBException, ErrorCodes::InvalidBSON);
+    session->end();
+}
+
+TEST_F(GRPCSessionTest, OversizedEncodedClientMetadataIsRejected) {
+    const auto encoded = base64::encode(std::string(8 * 1024, 'a'));
+    auto session = makeIngressSessionWithMetadata(encoded);
+    ASSERT_THROWS_CODE(
+        session->getClientMetadata(), DBException, ErrorCodes::ClientMetadataDocumentTooLarge);
+    session->end();
+}
+
+TEST_F(GRPCSessionTest, InvalidBase64ClientMetadataIsRejected) {
+    auto session = makeIngressSessionWithMetadata("!!!!"_sd);
+    ASSERT_THROWS(session->getClientMetadata(), DBException);
     session->end();
 }
 

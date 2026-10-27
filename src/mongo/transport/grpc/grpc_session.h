@@ -337,7 +337,8 @@ public:
      * The first time this method is called, the metadata document will be decoded and parsed, which
      * can be expensive. It will be cached for future invocations.
      *
-     * Throws an exception if the client provided improperly formatted metadata.
+     * Throws an exception if the client provided improperly formatted metadata, including metadata
+     * that is not a single, structurally valid BSON document.
      */
     boost::optional<const ClientMetadata&> getClientMetadata() const;
 

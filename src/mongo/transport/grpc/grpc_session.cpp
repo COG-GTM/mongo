@@ -29,6 +29,7 @@
 
 #include "mongo/transport/grpc/grpc_session.h"
 
+#include "mongo/bson/bson_validate.h"
 #include "mongo/config.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/logv2/log.h"
@@ -41,6 +42,10 @@
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo::transport::grpc {
+namespace {
+// Comfortably above the base64 encoding of the largest metadata document ClientMetadata accepts.
+constexpr size_t kMaxEncodedClientMetadataSize = 4 * 1024;
+}  // namespace
 
 GRPCSession::GRPCSession(TransportLayer* tl, HostAndPort remote)
     : _tl(tl), _remote(std::move(remote)) {
@@ -219,9 +224,27 @@ boost::optional<const ClientMetadata&> IngressSession::getClientMetadata() const
         return **decoded;
     }
 
+    uassert(ErrorCodes::ClientMetadataDocumentTooLarge,
+            fmt::format("The encoded gRPC client metadata must be at most {} bytes",
+                        kMaxEncodedClientMetadataSize),
+            _encodedClientMetadata->size() <= kMaxEncodedClientMetadataSize);
+
     fmt::memory_buffer buffer{};
     base64::decode(buffer, *_encodedClientMetadata);
+
+    uassert(ErrorCodes::InvalidBSON,
+            "The gRPC client metadata is too short to be a BSON document",
+            buffer.size() >= static_cast<size_t>(BSONObj::kMinBSONLength));
+    uassertStatusOKWithContext(validateBSON(buffer.data(), buffer.size()),
+                               "Invalid gRPC client metadata document");
     BSONObj metadataDocument(buffer.data());
+    uassert(ErrorCodes::InvalidBSON,
+            fmt::format("The gRPC client metadata document size ({}) does not match the decoded "
+                        "header size ({})",
+                        metadataDocument.objsize(),
+                        buffer.size()),
+            static_cast<size_t>(metadataDocument.objsize()) == buffer.size());
+
     decoded->emplace(std::move(metadataDocument));
     return **decoded;
 }
