@@ -40,6 +40,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/rpc/message.h"
+#include "mongo/rpc/op_compressed.h"
 #include "mongo/transport/message_compressor_noop.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/transport/message_compressor_snappy.h"
@@ -189,6 +190,54 @@ void checkOverflow(std::unique_ptr<MessageCompressorBase> compressor) {
         compressor->decompressData(tooSmallRange, DataRange(scratch.data(), scratch.size())));
 }
 
+// Builds an OP_COMPRESSED message whose compressed body decompresses to fewer bytes than the
+// header claims and asserts that the manager rejects it rather than returning a message whose
+// tail is uninitialized memory.
+void checkShortDecompressionRejected(std::unique_ptr<MessageCompressorBase> compressor) {
+    const std::string payload = "Hello, world!";
+    const int32_t claimedSize = static_cast<int32_t>(payload.size()) + 4096;
+
+    std::vector<char> compressed(compressor->getMaxCompressedSize(payload.size()));
+    auto swCompressedLen =
+        compressor->compressData(ConstDataRange(payload.data(), payload.size()),
+                                 DataRange(compressed.data(), compressed.size()));
+    ASSERT_OK(swCompressedLen);
+    const auto compressedLen = swCompressedLen.getValue();
+
+    std::vector<char> scratch(claimedSize);
+    auto swDirect = compressor->decompressData(ConstDataRange(compressed.data(), compressedLen),
+                                               DataRange(scratch.data(), scratch.size()));
+    if (swDirect.isOK()) {
+        ASSERT_EQ(swDirect.getValue(), payload.size());
+    }
+
+    MessageCompressorRegistry registry;
+    const auto compressorName = compressor->getName();
+    const auto compressorId = compressor->getId();
+    registry.setSupportedCompressors({compressorName});
+    registry.registerImplementation(std::move(compressor));
+    registry.finalizeSupportedCompressors().transitional_ignore();
+    MessageCompressorManager mgr(&registry);
+
+    const size_t messageLen =
+        MsgData::MsgDataHeaderSize + CompressionHeader::size() + compressedLen;
+    auto buffer = SharedBuffer::allocate(messageLen);
+    MsgData::View view(buffer.get());
+    view.setId(1);
+    view.setResponseToMsgId(0);
+    view.setOperation(dbCompressed);
+    view.setLen(messageLen);
+
+    DataRangeCursor cursor(view.data(), view.data() + view.dataLen());
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(dbMsg);
+    cursor.writeAndAdvance<LittleEndian<int32_t>>(claimedSize);
+    cursor.writeAndAdvance<LittleEndian<uint8_t>>(compressorId);
+    memcpy(view.data() + CompressionHeader::size(), compressed.data(), compressedLen);
+
+    auto status = mgr.decompressMessage(Message(buffer), nullptr).getStatus();
+    ASSERT_EQ(status.code(), ErrorCodes::BadValue);
+}
+
 Message buildMessage() {
     const auto data = std::string{"Hello, world!"};
     const auto bufferSize = MsgData::MsgDataHeaderSize + data.size();
@@ -292,6 +341,18 @@ TEST(ZlibMessageCompressor, Overflow) {
 
 TEST(ZstdMessageCompressor, Overflow) {
     checkOverflow(std::make_unique<ZstdMessageCompressor>());
+}
+
+TEST(SnappyMessageCompressor, ShortDecompressionRejected) {
+    checkShortDecompressionRejected(std::make_unique<SnappyMessageCompressor>());
+}
+
+TEST(ZlibMessageCompressor, ShortDecompressionRejected) {
+    checkShortDecompressionRejected(std::make_unique<ZlibMessageCompressor>());
+}
+
+TEST(ZstdMessageCompressor, ShortDecompressionRejected) {
+    checkShortDecompressionRejected(std::make_unique<ZstdMessageCompressor>());
 }
 
 TEST(MessageCompressorManager, SERVER_28008) {
